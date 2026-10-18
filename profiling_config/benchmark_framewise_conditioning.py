@@ -49,7 +49,10 @@ PREPARED_DIR = Path(
 CANDIDATE = "framewise"
 SWITCH_NAME = "framewise_conditioning"
 COMPARISON_LABEL = "Framewise conditioning"
-FIXED_OPTIMIZATIONS = {"chunkwise_flash_attention": True, "fused_norm_modulation": False}
+FIXED_OPTIMIZATIONS = {
+    "chunkwise_flash_attention": True, "fused_norm_modulation": False,
+    "reuse_rope_frequencies": False,
+}
 MODES = {"original": False, CANDIDATE: True}
 
 
@@ -532,8 +535,16 @@ def quality(args, report):
     print("QUALITY", json.dumps(report["quality"]), flush=True)
 
 
-@torch.inference_mode()
-def main(args=None, report_metadata=None, forward_diagnostics=None):
+def main(args=None, report_metadata=None, forward_diagnostics=None, execution_mode="inference_mode"):
+    """Keep historical execution unless a caller explicitly requests official no_grad."""
+    contexts = {"inference_mode": torch.inference_mode, "no_grad": torch.no_grad}
+    if execution_mode not in contexts:
+        raise ValueError(f"Unsupported execution mode: {execution_mode}")
+    with contexts[execution_mode]():
+        return _run_main(args, report_metadata, forward_diagnostics, execution_mode)
+
+
+def _run_main(args, report_metadata, forward_diagnostics, execution_mode):
     args = args or parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if (args.output_dir / "benchmark.json").exists():
@@ -551,6 +562,8 @@ def main(args=None, report_metadata=None, forward_diagnostics=None):
         "task": manifest.get("task"), "save_fps": int(manifest["args"].get("save_fps", 8)),
         "prepared_manifest": manifest,
         "prepared_dir": str(args.prepared_dir.resolve()),
+        "execution_mode": execution_mode,
+        "autocast_cache_enabled": torch.is_autocast_cache_enabled(),
         "comparison": {"candidate": CANDIDATE, "switch": SWITCH_NAME,
                        "label": COMPARISON_LABEL, "fixed_optimizations": FIXED_OPTIMIZATIONS},
         "checkpoint": str(args.checkpoint.resolve()), "checkpoint_load_strict": True,

@@ -33,10 +33,15 @@ class OptimizationConfig:
     framewise_conditioning: bool = True
     # Fuse only supported cached inference calls; reference arithmetic remains available.
     fused_norm_modulation: bool = True
+    # Reuse RoPE coefficients within one cached inference forward, never across calls.
+    reuse_rope_frequencies: bool = True
 
     def __post_init__(self) -> None:
         # bool("false") is True: never coerce strings/numbers into switches.
-        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation"):
+        for name in (
+            "chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation",
+            "reuse_rope_frequencies",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a TOML/Python boolean")
 
@@ -47,6 +52,7 @@ class OptimizationConfig:
             "chunkwise_flash_attention": self.chunkwise_flash_attention,
             "framewise_conditioning": self.framewise_conditioning,
             "fused_norm_modulation": self.fused_norm_modulation,
+            "reuse_rope_frequencies": self.reuse_rope_frequencies,
         }
 
     def snapshot(self) -> dict:
@@ -72,6 +78,7 @@ def load_optimization_config(
         values = tomllib.load(stream)
     unknown = set(values) - {
         "schema_version", "chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation",
+        "reuse_rope_frequencies",
     }
     if unknown:
         raise ValueError(f"Unknown optimization config keys in {path}: {', '.join(sorted(unknown))}")
@@ -83,4 +90,5 @@ def load_optimization_config(
         source_path=str(path),
         framewise_conditioning=values.get("framewise_conditioning", True),
         fused_norm_modulation=values.get("fused_norm_modulation", True),
+        reuse_rope_frequencies=values.get("reuse_rope_frequencies", True),
     )

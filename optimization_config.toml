@@ -25,3 +25,9 @@ framewise_conditioning = true
 # Training, gradient-enabled calls, and unsupported inputs use the reference path.
 # Reduction order may still differ; false selects the original separate operations.
 fused_norm_modulation = true
+
+# Build the current RoPE coefficients once per cached inference forward and share
+# them across Q/K and all transformer blocks. Preserve the original construction
+# device, dtype, positions, and the checkpoint-table special case. No persistent
+# cache or invalidation state is introduced; training/grad-enabled calls fall back.
+reuse_rope_frequencies = true

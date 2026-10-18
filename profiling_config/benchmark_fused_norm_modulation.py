@@ -36,7 +36,8 @@ def configure_protocol():
     protocol.configure_comparison(
         candidate="fused", switch_name="fused_norm_modulation",
         label="Fused RMSNorm/AdaLN",
-        fixed_optimizations={"chunkwise_flash_attention": True, "framewise_conditioning": True},
+        fixed_optimizations={"chunkwise_flash_attention": True, "framewise_conditioning": True,
+                             "reuse_rope_frequencies": False},
     )
 
 

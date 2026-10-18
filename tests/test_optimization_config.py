@@ -44,6 +44,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
             "chunkwise_flash_attention": False,
             "framewise_conditioning": True,
             "fused_norm_modulation": True,
+            "reuse_rope_frequencies": True,
         }
         for config in (from_path, from_string, from_instance):
             self.assertEqual(config.as_dict(), expected)
@@ -55,6 +56,27 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
         self.assertIs(load_optimization_config(self.path).chunkwise_flash_attention, True)
         self.assertIs(load_optimization_config(self.path).framewise_conditioning, True)
         self.assertIs(load_optimization_config(self.path).fused_norm_modulation, True)
+        self.assertIs(load_optimization_config(self.path).reuse_rope_frequencies, True)
+
+    def test_rope_reuse_is_independent_and_serialized(self):
+        self.assertIs(OptimizationConfig().reuse_rope_frequencies, True)
+        self.write_config("schema_version = 1\nreuse_rope_frequencies = false\n")
+        config = load_optimization_config(self.path)
+        self.assertIs(config.reuse_rope_frequencies, False)
+        self.assertIs(config.chunkwise_flash_attention, True)
+        self.assertIs(config.framewise_conditioning, True)
+        self.assertIs(config.fused_norm_modulation, True)
+        self.assertIs(config.snapshot()["requested"]["reuse_rope_frequencies"], False)
+        self.write_config(
+            "schema_version = 1\nchunkwise_flash_attention = false\n"
+            "framewise_conditioning = false\nfused_norm_modulation = false\n"
+            "reuse_rope_frequencies = true\n"
+        )
+        config = load_optimization_config(self.path)
+        self.assertIs(config.reuse_rope_frequencies, True)
+        self.assertIs(config.chunkwise_flash_attention, False)
+        self.assertIs(config.framewise_conditioning, False)
+        self.assertIs(config.fused_norm_modulation, False)
 
     def test_fused_norm_is_independent_and_serialized(self):
         self.assertIs(OptimizationConfig().fused_norm_modulation, True)
@@ -115,7 +137,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
     def test_strings_and_numbers_are_not_boolean_switches(self):
         # bool("false") and bool(1) would both silently turn the switch on.
-        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies"):
             for value in ('"false"', "0", "1", "[]"):
                 with self.subTest(name=name, value=value):
                     self.write_config(f"schema_version = 1\n{name} = {value}\n")
@@ -123,7 +145,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
                         load_optimization_config(self.path)
 
     def test_python_config_also_rejects_non_boolean_switches(self):
-        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies"):
             for value in ("false", 0, 1, None):
                 with self.subTest(name=name, value=value):
                     with self.assertRaises(TypeError):

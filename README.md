@@ -206,6 +206,7 @@ schema_version = 1
 chunkwise_flash_attention = true
 framewise_conditioning = true
 fused_norm_modulation = true
+reuse_rope_frequencies = true
 ```
 
 Set `chunkwise_flash_attention` to `false` to use the original masked SDPA in `forward_with_cache`.
@@ -239,6 +240,16 @@ installations without Triton retain the reference operations; execution errors
 are not silently hidden. Q/K norms, conditioning norms, and residual additions
 are separate operations. Set this switch to `false` for an isolated reference
 comparison while keeping the other optimizations enabled.
+
+`reuse_rope_frequencies = true` shares the original RoPE cosine/sine tensors
+across Q/K and transformer blocks within one cached eval forward with gradients
+disabled. Without reuse, each block obtains the same coefficients separately
+for Q and K: 56 calls for the 28-block model, versus one with reuse enabled.
+It preserves the original construction device/dtype and checkpoint-table special
+case. The tensors are local to that call: there is no persistent lookup cache,
+cross-step state, or change to history eviction and position renumbering.
+Ordinary/training forward, custom RoPE implementations, and forward hooks retain
+the original path. Set this switch to `false` for an isolated reference comparison.
 
 Select another file with `python -m miniworld.sample --optimization_config
 /path/to/experiment.toml` plus the usual sampling arguments, or set

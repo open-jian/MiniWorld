@@ -254,6 +254,15 @@ class PatchEmbed3D(nn.Module):
         return x
 
 
+def _has_forward_observers(module: nn.Module) -> bool:
+    """Hooks can observe input dtypes/kwargs even when tensor results agree."""
+    return bool(
+        module._forward_pre_hooks or module._forward_hooks
+        or getattr(nn.modules.module, "_global_forward_pre_hooks", {})
+        or getattr(nn.modules.module, "_global_forward_hooks", {})
+    )
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -409,9 +418,13 @@ class VisionRotaryEmbeddingFast3D(nn.Module):
             start_frame=start_frame,
         )
 
-    def forward(self, t: Tensor, num_frames_override: Optional[int] = None, start_frame: int = 0) -> Tensor:
+    def forward(
+        self, t: Tensor, num_frames_override: Optional[int] = None, start_frame: int = 0,
+        freqs: Optional[Tuple[Tensor, Tensor]] = None,
+    ) -> Tensor:
         num_frames = num_frames_override if num_frames_override is not None else self._num_frames
-        cos, sin = self._get_freqs(num_frames, t.device, start_frame=start_frame)
+        cos, sin = (self._get_freqs(num_frames, t.device, start_frame=start_frame)
+                    if freqs is None else freqs)
         return t * cos + rotate_half(t) * sin
 
     def rope_shift_time(self, delta: int, cached: Tensor) -> Tensor:
@@ -1125,7 +1138,30 @@ class MiniWorldModel(nn.Module):
                 dtype=x.dtype,
             )
 
+        reuse_rope_frequencies = (
+            self.optimization_config.reuse_rope_frequencies
+            and not self.training and not torch.is_grad_enabled()
+            and type(self.feat_rope) is VisionRotaryEmbeddingFast3D
+            and "forward" not in self.feat_rope.__dict__
+            and not _has_forward_observers(self.feat_rope)
+        )
+        # Q/K and every layer use the same current-frame positions. Build the
+        # frequency tensors lazily in the original autocast context, through
+        # _get_freqs itself: its trained-length/precomputed-buffer branch must
+        # stay intact. This dictionary belongs only to this forward, so changes
+        # to offsets, weights, devices, or CFG inputs cannot leave stale state.
+        rope_freqs: Dict[torch.device, Tuple[Tensor, Tensor]] = {}
+
         def feat_rope_current(tt: Tensor) -> Tensor:
+            if reuse_rope_frequencies:
+                if tt.device not in rope_freqs:
+                    rope_freqs[tt.device] = self.feat_rope._get_freqs(
+                        grid_t_cur, tt.device, start_frame=int(current_position_offset),
+                    )
+                return self.feat_rope(
+                    tt, num_frames_override=grid_t_cur, start_frame=int(current_position_offset),
+                    freqs=rope_freqs[tt.device],
+                )
             return self.feat_rope(tt, num_frames_override=grid_t_cur, start_frame=int(current_position_offset))
 
         # Eligibility is structural: never inspect timestep values on the GPU
