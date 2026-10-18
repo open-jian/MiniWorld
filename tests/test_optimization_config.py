@@ -45,6 +45,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
             "framewise_conditioning": True,
             "fused_norm_modulation": True,
             "reuse_rope_frequencies": True,
+            "fused_residual_gate_add": True,
         }
         for config in (from_path, from_string, from_instance):
             self.assertEqual(config.as_dict(), expected)
@@ -57,6 +58,27 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
         self.assertIs(load_optimization_config(self.path).framewise_conditioning, True)
         self.assertIs(load_optimization_config(self.path).fused_norm_modulation, True)
         self.assertIs(load_optimization_config(self.path).reuse_rope_frequencies, True)
+        self.assertIs(load_optimization_config(self.path).fused_residual_gate_add, True)
+
+    def test_residual_gate_add_is_independent_and_serialized(self):
+        self.assertIs(OptimizationConfig().fused_residual_gate_add, True)
+        self.write_config("schema_version = 1\nfused_residual_gate_add = false\n")
+        config = load_optimization_config(self.path)
+        self.assertIs(config.fused_residual_gate_add, False)
+        self.assertIs(config.snapshot()["requested"]["fused_residual_gate_add"], False)
+        for name in ("chunkwise_flash_attention", "framewise_conditioning",
+                     "fused_norm_modulation", "reuse_rope_frequencies"):
+            self.assertIs(getattr(config, name), True)
+        self.write_config(
+            "schema_version = 1\nchunkwise_flash_attention = false\n"
+            "framewise_conditioning = false\nfused_norm_modulation = false\n"
+            "reuse_rope_frequencies = false\nfused_residual_gate_add = true\n"
+        )
+        config = load_optimization_config(self.path)
+        self.assertIs(config.fused_residual_gate_add, True)
+        for name in ("chunkwise_flash_attention", "framewise_conditioning",
+                     "fused_norm_modulation", "reuse_rope_frequencies"):
+            self.assertIs(getattr(config, name), False)
 
     def test_rope_reuse_is_independent_and_serialized(self):
         self.assertIs(OptimizationConfig().reuse_rope_frequencies, True)
@@ -137,7 +159,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
     def test_strings_and_numbers_are_not_boolean_switches(self):
         # bool("false") and bool(1) would both silently turn the switch on.
-        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies", "fused_residual_gate_add"):
             for value in ('"false"', "0", "1", "[]"):
                 with self.subTest(name=name, value=value):
                     self.write_config(f"schema_version = 1\n{name} = {value}\n")
@@ -145,7 +167,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
                         load_optimization_config(self.path)
 
     def test_python_config_also_rejects_non_boolean_switches(self):
-        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies", "fused_residual_gate_add"):
             for value in ("false", 0, 1, None):
                 with self.subTest(name=name, value=value):
                     with self.assertRaises(TypeError):

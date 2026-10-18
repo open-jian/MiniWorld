@@ -204,6 +204,7 @@ chunkwise_flash_attention = true
 framewise_conditioning = true
 fused_norm_modulation = true
 reuse_rope_frequencies = true
+fused_residual_gate_add = true
 ```
 
 将 `chunkwise_flash_attention` 改为 `false` 后，流式 `forward_with_cache` 使用原来的带 mask SDPA。
@@ -234,6 +235,13 @@ Q/K norm、条件编码 norm 和残差相加保持独立。显式设为 `false` 
 28 层共 56 次；开启后同一次前向只获取一次。保留原构表设备、dtype 和使用 checkpoint
 已有表的特殊路径；系数只存在于当前调用，不跨去噪步缓存，不改变历史淘汰与位置重编号。
 普通前向、训练、自定义 RoPE 实现或 forward hook 保留原路径；设为 `false` 可单独对照。
+
+`fused_residual_gate_add = true` 将每个 block 两处的 `gate * update` 和残差相加
+合并到一个 Triton kernel。保留乘法结果先舍入 BF16、再相加的顺序，不改成只舍入
+一次的融合乘加。直接按实际 stride 读取并保留残差布局，省去 gated-update 中间张量，
+不增加长期缓存。仅作用于关闭梯度、受支持的 CUDA BF16 cached eval；普通前向、训练、
+不支持的输入或未安装 Triton 时保留原操作。设为 `false` 只关闭这一项，其他开关独立，
+checkpoint 字段、sink、历史窗口和采样设置不变。
 
 直接运行采样入口时可加 `--optimization_config /path/to/experiment.toml`；
 上述 DROID、RE10K 采样脚本和吞吐脚本支持 `OPTIMIZATION_CONFIG=/path/to/experiment.toml`。

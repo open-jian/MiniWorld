@@ -207,6 +207,7 @@ chunkwise_flash_attention = true
 framewise_conditioning = true
 fused_norm_modulation = true
 reuse_rope_frequencies = true
+fused_residual_gate_add = true
 ```
 
 Set `chunkwise_flash_attention` to `false` to use the original masked SDPA in `forward_with_cache`.
@@ -250,6 +251,17 @@ case. The tensors are local to that call: there is no persistent lookup cache,
 cross-step state, or change to history eviction and position renumbering.
 Ordinary/training forward, custom RoPE implementations, and forward hooks retain
 the original path. Set this switch to `false` for an isolated reference comparison.
+
+`fused_residual_gate_add = true` combines `gate * update` and residual addition
+in one Triton kernel at each block's two residual connections. The BF16 product
+is rounded before addition, as in the separate operations; it is not replaced
+by a single-rounding fused multiply-add. The kernel reads the actual strides
+and preserves the channel-major residual layout without an intermediate gated
+update or a persistent cache. It applies only to supported CUDA BF16 cached
+eval calls with gradients disabled. Ordinary forward, training, unsupported
+inputs, and installations without Triton keep the original operations.
+Set it to `false` to disable only this optimization; all other switches remain
+independent. It does not change checkpoint keys, sink, history windows or sampling.
 
 Select another file with `python -m miniworld.sample --optimization_config
 /path/to/experiment.toml` plus the usual sampling arguments, or set

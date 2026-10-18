@@ -31,3 +31,10 @@ fused_norm_modulation = true
 # device, dtype, positions, and the checkpoint-table special case. No persistent
 # cache or invalidation state is introduced; training/grad-enabled calls fall back.
 reuse_rope_frequencies = true
+
+# Fuse gate * update and residual addition in eligible cached CUDA BF16 eval.
+# Keep the product's BF16 rounding before addition, and preserve the residual
+# layout. No intermediate gated-update tensor or persistent cache is allocated.
+# Unsupported inputs, training, and gradient-enabled calls use the original path.
+# Set false for an independent comparison with all other switches unchanged.
+fused_residual_gate_add = true

@@ -44,6 +44,7 @@ from flash_attn import flash_attn_func
 
 from miniworld.optimization_config import OptimizationConfig, load_optimization_config
 from miniworld.fused_norm_modulation import can_fuse_norm_modulation, fused_norm_modulation
+from miniworld.fused_residual_gate_add import can_fuse_residual_gate_add, fused_residual_gate_add
 
 # FlexAttention is optional; disabled by default
 create_block_mask = None
@@ -164,6 +165,20 @@ def _apply_gate(
     if conditioning_tokens_per_frame is None:
         return gate * update
     return (gate * update.unflatten(1, (-1, conditioning_tokens_per_frame))).flatten(1, 2)
+
+
+def _residual_gate_add(
+    residual: Tensor, update: Tensor, gate: Tensor,
+    conditioning_tokens_per_frame: Optional[int] = None, use_fused: bool = False,
+) -> Tensor:
+    """Avoid the gated-update temporary while retaining its BF16 rounding."""
+    if use_fused and can_fuse_residual_gate_add(
+        residual, update, gate, conditioning_tokens_per_frame,
+    ):
+        return fused_residual_gate_add(residual, update, gate, conditioning_tokens_per_frame)
+    # Keep the reference multiply/add order and broadcasting, including autograd
+    # and dtypes/layouts outside the inference kernel's explicit contract.
+    return residual + _apply_gate(update, gate, conditioning_tokens_per_frame)
 
 
 class RMSNorm(nn.Module):
@@ -651,6 +666,7 @@ class MiniWorldBlock(nn.Module):
         cached_chunk_tokens: Optional[int] = None,
         conditioning_tokens_per_frame: Optional[int] = None,
         use_fused_norm_modulation: bool = False,
+        use_fused_residual_gate_add: bool = False,
     ):
         mod = self.modulation(emb, shared_mod, pose_mod, conditioning_tokens_per_frame)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
@@ -670,12 +686,18 @@ class MiniWorldBlock(nn.Module):
             attn_out, new_kv = attn_result
         else:
             attn_out, new_kv = attn_result, None
-        x = x + _apply_gate(attn_out, gate_msa, conditioning_tokens_per_frame)
+        x = _residual_gate_add(
+            x, attn_out, gate_msa, conditioning_tokens_per_frame,
+            use_fused=use_fused_residual_gate_add and not self.training,
+        )
         mlp_out = self.mlp(_norm_modulate(
             self.norm2, x, shift_mlp, scale_mlp,
             conditioning_tokens_per_frame, use_fused_norm_modulation,
         ))
-        x = x + _apply_gate(mlp_out, gate_mlp, conditioning_tokens_per_frame)
+        x = _residual_gate_add(
+            x, mlp_out, gate_mlp, conditioning_tokens_per_frame,
+            use_fused=use_fused_residual_gate_add and not self.training,
+        )
         if return_kv:
             return x, new_kv
         return x
@@ -1178,6 +1200,9 @@ class MiniWorldModel(nn.Module):
         # per-call predicate also rejects enabled gradients and unsupported
         # layouts/dtypes instead of silently copying or lowering precision.
         use_fused_norm_modulation = self.optimization_config.fused_norm_modulation and not self.training
+        # Residual fusion is independent of attention, conditioning, and norm
+        # switches. The helper validates dtype/stride/grad eligibility per call.
+        use_fused_residual_gate_add = self.optimization_config.fused_residual_gate_add and not self.training
         frame_ids = torch.arange(n_cur, device=x.device, dtype=torch.long) // tokens_per_frame
         emb_tok, shared_mod_tok, pose_mod_tok = self._build_conditioning(
             t, y, b, grid_t_cur, n_cur, frame_ids, x.device, x.dtype, cond_drop,
@@ -1193,6 +1218,7 @@ class MiniWorldModel(nn.Module):
                 cached_chunk_tokens=cached_chunk_tokens,
                 conditioning_tokens_per_frame=conditioning_tokens_per_frame,
                 use_fused_norm_modulation=use_fused_norm_modulation,
+                use_fused_residual_gate_add=use_fused_residual_gate_add,
             )
             if return_kv:
                 x, new_kv_list[idx] = out
