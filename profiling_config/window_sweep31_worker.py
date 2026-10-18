@@ -1,0 +1,111 @@
+"""Length extrapolation experiment. Official weights/core; runtime guard override documented."""
+import os,sys,json,time,argparse,subprocess,concurrent.futures
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image,ImageDraw
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from benchmark_500_frames import Recorder,save_video,dump
+from miniworld import sample
+from miniworld.data.droid import LeRobotActionDataset
+from miniworld.vae.codec import load_wan22_vae,vae_encode,StreamingVAEDecoder
+from miniworld.conditioning.actions import ConditioningConfig,build_cond_seq_for_batch
+R=Path('/data2/jian/output/Miniworld/DROID_long_horizon/window_sweep31_gt_episode022694')
+C=Path('/data2/jian/checkpoints/miniworld')
+
+def main():
+ parser=argparse.ArgumentParser();parser.add_argument('--episode',type=int,required=True);parser.add_argument('--worker',type=int,default=0);opt=parser.parse_args();ep=opt.episode
+ artifact=lambda mode,name:R/f'episode_{ep:06d}_w{mode:03d}_{name}'
+ phase=lambda value:dump(R/f'episode_{ep:06d}_worker{opt.worker}_state.json',dict(episode=ep,phase=value,time=time.time(),pid=os.getpid()))
+ torch.set_num_threads(4)
+ entry=next(x for x in json.loads((R/'selection.json').read_text())['videos'] if x['episode_index']==ep)
+ sys.argv=[sys.argv[0],'--dataset','droid','--checkpoint',str(C/'MiniWorld_1b_droid.pt'),'--vae_checkpoint',str(C/'Wan2.2_VAE.pth')]
+ args=sample.parse_args();dataset=LeRobotActionDataset('/data2/jian/benchmark/droid',num_frames=1277,frame_interval=1,randomize=False,color_aug=False,max_keep=1)
+ sample.resolve_conditioning(args,dataset)
+ ckpt=torch.load(args.checkpoint,map_location='cpu',weights_only=False);meta=ckpt.get('meta',{});weights=ckpt.get('ema_model',ckpt.get('model',ckpt))
+ args.latent_frames=sample.resolve_latent_frames(weights,meta,args);assert args.latent_frames==64
+ model=sample.build_denoiser(args).cuda().eval();sample.load_weights(weights,model);del ckpt,weights
+ vae=load_wan22_vae(args)
+ # Replace only clean committed history. Never overwrite generated z_global or RGB.
+ original_forward=model.net.forward_with_cache
+ gt_history={'cursor':0,'pending':None,'records':[]}
+ def gt_forward(*inputs,**kw):
+  if kw.get('return_kv',False):
+   x,t,c=inputs;branch='uncond' if kw.get('cond_drop') is not None else 'cond'
+   assert torch.count_nonzero(t).item()==0
+   if branch=='cond':
+    start=gt_history['cursor'];end=start+x.shape[2]
+    assert end<=latents.shape[2]
+    gt_history['pending']=(start,end)
+   else:
+    assert gt_history['pending'] is not None
+    start,end=gt_history['pending']
+   replacement=latents[:,:,start:end]
+   assert replacement.shape==x.shape
+   gt_history['records'].append(dict(branch=branch,start_latent=start,end_latent_exclusive=end,cache_position=kw.get('current_position_offset',0),source='GT VAE latent',generated_vs_gt_mse=float((x.float()-replacement.float()).square().mean().item())))
+   result=original_forward(replacement,t,c,**kw)
+   if branch=='uncond':
+    gt_history['cursor']=end;gt_history['pending']=None
+   return result
+  return original_forward(*inputs,**kw)
+ model.net.forward_with_cache=gt_forward
+ rec=Recorder(model)
+ dump(R/f'episode_{ep:06d}_worker{opt.worker}_environment.json',dict(torch=torch.__version__,cuda=torch.version.cuda,gpu=torch.cuda.get_device_name(),physical_gpu=os.environ['CUDA_VISIBLE_DEVICES'],checkpoint_training_latent_frames=64,permitted_experiment_window=256,extension='Only model.trained_num_frames runtime guard value is set to 256 for extrapolation; checkpoint weights, RoPE frequencies and core source remain unchanged.',args=vars(args),git_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).resolve().parents[1],text=True).strip()))
+ dataset._parquet_path=lambda _:Path(entry['parquet'])
+ video,ids=dataset._decode_clip(Path(entry['source']));actions=dataset._load_actions(ep,ids).unsqueeze(0).cuda()
+ gt=((video+1)*127.5).round().clamp(0,255).to(torch.uint8).numpy()
+ if opt.worker==0:np.save(R/f'episode_{ep:06d}_ground_truth_rgb.npy',gt)
+ with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16):
+  latents=vae_encode(vae,video.unsqueeze(0).cuda().permute(0,4,1,2,3).contiguous());assert latents.shape[2]==320
+  cond=build_cond_seq_for_batch(cfg=ConditioningConfig(False,True,15),poses=None,actions=actions,t_latent=320,h_lat=15,w_lat=20)
+  phase('warmup');gt_history.update(cursor=0,pending=None,records=[])
+  model.generate_eval_latents_streaming(latents[:,:,:64],cond[:,:64],total_len=64,history_len=1,max_cache_chunks=24,inflight_chunks=8,sink_frames=0,stream_decoder=StreamingVAEDecoder(vae),collect_stream_timing=False)
+  torch.cuda.synchronize();rec.clear();torch.cuda.empty_cache()
+  import lpips
+  from skimage.metrics import structural_similarity
+  perceptual=lpips.LPIPS(net='alex',version='0.1').cuda().float().eval()
+  def ssim(pair):return structural_similarity(pair[0],pair[1],data_range=255,channel_axis=2,gaussian_weights=True,sigma=1.5,use_sample_covariance=False,win_size=11)
+  for window in list(range(16,257,8))[opt.worker::4]:
+   if artifact(window,'complete.json').exists():continue
+   model.trained_num_frames=window # Guard only; true checkpoint training length remains 64, explicitly recorded.
+   rec.clear();decoded=[];gt_history.update(cursor=0,pending=None,records=[])
+   class Decoder(StreamingVAEDecoder):
+    def step(self,z):
+     out=super().step(z)
+     latest=rec.rows[-1]
+     decoded.append(dict(chunk_index=len(decoded),step=rec.step,cache_frames=latest['cache_frames'],query_frames=latest['current_frames'],active_window=latest['cache_frames']+latest['current_frames'],cache_bytes_both=2*latest['cache_bytes'],rgb_count=int(out.shape[2])))
+     return out
+   torch.manual_seed(20261016+ep);torch.cuda.synchronize();torch.cuda.empty_cache();torch.cuda.reset_peak_memory_stats()
+   phase(f'generation_w{window:03d}');start_unix=time.time();start=time.perf_counter()
+   pred_latents,pred=model.generate_eval_latents_streaming(latents,cond,total_len=320,history_len=1,max_cache_chunks=(window-16)//2,inflight_chunks=8,sink_frames=0,stream_decoder=Decoder(vae),collect_stream_timing=True)
+   torch.cuda.synchronize();seconds=time.perf_counter()-start;peak=torch.cuda.max_memory_allocated();reserved=torch.cuda.max_memory_reserved();rec.finish()
+   phase(f'writing_w{window:03d}')
+   rgb=((pred[0].permute(1,2,3,0).clamp(-1,1)+1)*127.5).to(torch.uint8).cpu().numpy();assert rgb.shape==gt.shape
+   np.save(artifact(window,'prediction_rgb.npy'),rgb)
+   save_video(artifact(window,'prediction.mp4'),rgb)
+   save_video(artifact(window,'comparison.mp4'),np.concatenate([gt,rgb],axis=2))
+   dump(artifact(window,'gt_history_commits.json'),gt_history['records']);dump(artifact(window,'forward_calls.json'),rec.rows);dump(artifact(window,'evictions.json'),rec.evictions);dump(artifact(window,'stream_timing.json'),model.last_eval_meta)
+   frame_end=-1
+   for row in decoded:
+    row['rgb_start']=frame_end+1;frame_end+=row['rgb_count'];row['rgb_end']=frame_end
+   dump(artifact(window,'decoded_chunks.json'),decoded)
+   dump(artifact(window,'summary.json'),dict(episode_index=ep,window=window,cache_capacity_latent=window-16,query_latent=16,sink_frames=0,effective_sampling_steps=40,checkpoint_training_latent=64,processed_rgb_frames=1277,latent_frames=320,generation_sec=seconds,generation_start_unix=start_unix,generated_rgb_fps=1276/seconds,peak_allocated_bytes=peak,peak_reserved_bytes=reserved,max_kv_bytes_both=max(r['cache_bytes'] for r in rec.rows)*2,history_source='GT VAE latent committed at t=0 in both CFG branches; in-flight region remains generated',seed=20261016+ep,physical_gpu=os.environ['CUDA_VISIBLE_DEVICES']))
+   print('DONE GENERATION',ep,window,seconds,flush=True)
+   del pred_latents,pred,rgb;rec.clear();torch.cuda.empty_cache()
+   phase(f'quality_w{window:03d}')
+   with concurrent.futures.ThreadPoolExecutor(4) as pool,torch.inference_mode(),torch.autocast('cuda',enabled=False):
+    rgb=np.load(artifact(window,'prediction_rgb.npy'),mmap_mode='r')
+    mse=np.mean((gt.astype(np.float64)-rgb.astype(np.float64))**2,axis=(1,2,3))
+    ss=list(pool.map(ssim,zip(gt,rgb)));lp=[]
+    for start in range(0,len(gt),32):
+     a=torch.from_numpy(gt[start:start+32]).permute(0,3,1,2).cuda().float()/127.5-1
+     b=torch.tensor(rgb[start:start+32].copy()).permute(0,3,1,2).cuda().float()/127.5-1
+     lp.extend(perceptual(a,b).flatten().cpu().tolist())
+    df=pd.DataFrame(dict(frame=np.arange(len(gt)),psnr_db=10*np.log10(255**2/np.maximum(mse,1e-12)),ssim=ss,lpips_alex=lp))
+    df.to_csv(artifact(window,'quality_per_frame.csv'),index=False)
+   dump(artifact(window,'complete.json'),dict(episode_index=ep,window=window,status='complete',time=time.time()))
+   print('DONE QUALITY',ep,window,flush=True)
+ dump(R/f'episode_{ep:06d}_worker{opt.worker}_complete.json',dict(episode_index=ep,status='complete',windows=list(range(16,257,8))))
+ phase('complete')
+if __name__=='__main__':main()
