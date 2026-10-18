@@ -20,6 +20,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" python -m miniworld.sample \
   --checkpoint "${CKPT}" \
   --vae_checkpoint "${VAE_CKPT}" \
   --sample_dir "${SAMPLE_DIR}" \
+  --optimization_config "${OPTIMIZATION_CONFIG:-${REPO_DIR}/optimization_config.toml}" \
   --wm_model "${MODEL}" \
   --total_len "${TOTAL_LEN:-96}" \
   --df_chunk_size 2 \
@@ -32,4 +33,3 @@ CUDA_VISIBLE_DEVICES="${GPU}" python -m miniworld.sample \
   --sample_num_videos "${SAMPLE_NUM_VIDEOS:-20}" \
   --benchmark_stream_timing \
   --benchmark_no_save
-

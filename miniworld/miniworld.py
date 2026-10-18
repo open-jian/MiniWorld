@@ -29,6 +29,7 @@ The forward signature is designed for ``miniworld.denoiser.Denoiser``.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -40,6 +41,8 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from flash_attn import flash_attn_func
+
+from miniworld.optimization_config import OptimizationConfig, load_optimization_config
 
 # FlexAttention is optional; disabled by default
 create_block_mask = None
@@ -93,6 +96,40 @@ def _build_cached_block_causal_mask(
         torch.full((), float("-inf"), device=device, dtype=dtype),
     )
     return float_mask
+
+
+def _chunkwise_flash_attention(q: Tensor, k: Tensor, v: Tensor, chunk_tokens: int) -> Tensor:
+    """Cached block-causal attention on tensors shaped ``(B, heads, N, D)``.
+
+    Each query chunk sees all cached tokens and the current-token prefix ending
+    at that chunk. These are exactly the finite entries of the streaming mask;
+    slicing them away preserves a single softmax over every visible key.
+    """
+    if chunk_tokens <= 0:
+        raise ValueError("chunk_tokens must be positive")
+    n_cur = q.shape[-2]
+    n_past = k.shape[-2] - n_cur
+    if n_cur == 0 or n_past < 0 or k.shape != v.shape:
+        raise ValueError("expected nonempty queries and matching K/V containing history + current tokens")
+
+    # SDPA autocast computes in the active low-precision dtype even when Q/K
+    # became FP32 in QK norm / RoPE. Cast only the attention inputs, once per
+    # layer: returned/stored KV retains its original dtype and RoPE positions.
+    dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else v.dtype
+    q = q.transpose(1, 2).to(dtype=dtype)
+    k = k.transpose(1, 2).to(dtype=dtype)
+    v = v.transpose(1, 2).to(dtype=dtype)
+    outputs = []
+    for start in range(0, n_cur, chunk_tokens):
+        end = min(start + chunk_tokens, n_cur)
+        # The whole current chunk is bidirectional, including its later tokens.
+        # causal=True would incorrectly introduce token-wise causality here.
+        outputs.append(flash_attn_func(
+            q[:, start:end], k[:, :n_past + end], v[:, :n_past + end], causal=False,
+        ))
+    # Cache commits commonly contain just one chunk; avoid a redundant copy.
+    output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
+    return output.transpose(1, 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +242,7 @@ class Attention(nn.Module):
         attn_mask: Optional[Tensor] = None,
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
+        cached_chunk_tokens: Optional[int] = None,
     ):
         B, N, C = x.shape
         in_dtype = x.dtype
@@ -222,7 +260,13 @@ class Attention(nn.Module):
             k = torch.cat([k_past.to(dtype=k.dtype, device=k.device), k], dim=-2)
             v = torch.cat([v_past.to(dtype=v.dtype, device=v.device), v], dim=-2)
 
-        if attn_mask is None and past_kv is None:
+        if cached_chunk_tokens is not None:
+            if attn_mask is not None:
+                raise ValueError("cached_chunk_tokens cannot be combined with an arbitrary attention mask")
+            # Projection, QK norm, RoPE and KV concatenation remain shared by
+            # both backends; only the block-causal attention evaluation changes.
+            x = _chunkwise_flash_attention(q, k, v, cached_chunk_tokens)
+        elif attn_mask is None and past_kv is None:
             # flash-attn fast path expects (B, N, num_heads, head_dim)
             q = q.transpose(1, 2).to(torch.bfloat16)
             k = k.transpose(1, 2).to(torch.bfloat16)
@@ -537,6 +581,7 @@ class MiniWorldBlock(nn.Module):
         attn_mask: Optional[Tensor] = None,
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
+        cached_chunk_tokens: Optional[int] = None,
     ):
         mod = self.modulation(emb, shared_mod, pose_mod)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
@@ -547,6 +592,7 @@ class MiniWorldBlock(nn.Module):
             attn_mask=attn_mask,
             past_kv=past_kv,
             return_kv=return_kv,
+            cached_chunk_tokens=cached_chunk_tokens,
         )
         if return_kv:
             attn_out, new_kv = attn_result
@@ -602,6 +648,7 @@ class MiniWorldModel(nn.Module):
         # Kept for checkpoint compatibility; MiniWorld always uses RoPE.
         use_rope: bool = True,
         use_abs_pos: bool = False,
+        optimization_config: OptimizationConfig | str | Path | None = None,
     ) -> None:
         super().__init__()
         assert adaln_mode in _MODES, f"adaln_mode must be one of {_MODES}"
@@ -613,6 +660,10 @@ class MiniWorldModel(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        # Per-model, immutable execution options. Loading here also covers
+        # direct Python/profile callers; nothing is read from disk per forward
+        # or registered in state_dict, so checkpoint keys remain unchanged.
+        self.optimization_config = load_optimization_config(optimization_config)
         self.depth = depth
         self.use_checkpoint = use_checkpoint
         self.cond_per_token = cond_per_token
@@ -929,8 +980,20 @@ class MiniWorldModel(nn.Module):
         return_kv: bool = False,
         chunk_size: int = 1,
         cond_drop: Optional[Tensor] = None,
+        use_chunk_flash_attn: Optional[bool] = None,
     ):
-        """Streaming forward with optional KV cache injection (RoPE-only)."""
+        """Streaming forward with optional KV cache injection (RoPE-only).
+
+        Chunk FlashAttention replaces only the cached block-causal attention
+        kernel. By default, inherit the model's optimization configuration.
+        Explicit ``use_chunk_flash_attn=True/False`` overrides it for this call
+        (preserving existing A/B benchmarks); False uses original masked SDPA.
+        Cache capacity, sink, chunk boundaries and RoPE are unchanged.
+        """
+        if use_chunk_flash_attn is None:
+            use_chunk_flash_attn = self.optimization_config.chunkwise_flash_attention
+        elif type(use_chunk_flash_attn) is not bool:
+            raise TypeError("use_chunk_flash_attn must be bool or None")
         b, c_in, t_cur, h_in, w_in = x.shape
         x = self.x_embedder(x)
 
@@ -958,14 +1021,28 @@ class MiniWorldModel(nn.Module):
                 f"{current_position_offset * tokens_per_frame}"
             )
 
-        attn_mask = _build_cached_block_causal_mask(
-            n_past=n_past,
-            n_cur=n_cur,
-            tokens_per_frame=tokens_per_frame,
-            chunk_size=max(1, int(chunk_size)),
-            device=x.device,
-            dtype=x.dtype,
+        # Explicit FlashAttention requires CUDA and FP16/BF16. Keep the original
+        # dense mask / SDPA path for FP32, CPU and unsupported head dimensions;
+        # never silently lower a caller's FP32 computation to enable the kernel.
+        attn_dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
+        use_chunk_flash_attn = (
+            use_chunk_flash_attn
+            and x.is_cuda
+            and attn_dtype in (torch.float16, torch.bfloat16)
+            and torch.cuda.get_device_capability(x.device)[0] >= 8
+            and all(block.attn.head_dim <= 256 and block.attn.head_dim % 8 == 0 for block in self.blocks)
         )
+        cached_chunk_tokens = tokens_per_frame * max(1, int(chunk_size)) if use_chunk_flash_attn else None
+        attn_mask = None
+        if not use_chunk_flash_attn:
+            attn_mask = _build_cached_block_causal_mask(
+                n_past=n_past,
+                n_cur=n_cur,
+                tokens_per_frame=tokens_per_frame,
+                chunk_size=max(1, int(chunk_size)),
+                device=x.device,
+                dtype=x.dtype,
+            )
 
         def feat_rope_current(tt: Tensor) -> Tensor:
             return self.feat_rope(tt, num_frames_override=grid_t_cur, start_frame=int(current_position_offset))
@@ -981,6 +1058,7 @@ class MiniWorldModel(nn.Module):
             out = block(
                 x, emb_tok, shared_mod_tok, pose_mod_tok, feat_rope_current, attn_mask,
                 past_kv_list[idx], return_kv,
+                cached_chunk_tokens=cached_chunk_tokens,
             )
             if return_kv:
                 x, new_kv_list[idx] = out

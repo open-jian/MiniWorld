@@ -1,0 +1,74 @@
+"""Validated, per-model inference switches; independent of checkpoint weights.
+
+Read once when a model is constructed, never inside the denoising loop. Each
+model keeps its own immutable snapshot so editing the file or building another
+model cannot change an already running experiment. Python 3.11's TOML parser
+also rejects duplicate keys, and no extra configuration dependency is needed.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+import tomllib
+
+
+# Resolve against this checkout, not the caller's working directory. Explicit
+# relative paths, in contrast, are intentionally relative to the caller's cwd.
+DEFAULT_OPTIMIZATION_CONFIG = Path(__file__).resolve().parents[1] / "optimization_config.toml"
+
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    """Only implemented execution optimizations belong here.
+
+    These are requests: the existing device/dtype guards may still select the
+    SDPA fallback. Sampling parameters, precision and model structure are kept
+    in their existing configuration rather than hidden behind a speed switch.
+    """
+
+    chunkwise_flash_attention: bool = True
+    # Provenance only; it is not a supported TOML key or a checkpoint tensor.
+    source_path: str | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # bool("false") is True: never coerce strings/numbers into switches.
+        if type(self.chunkwise_flash_attention) is not bool:
+            raise TypeError("chunkwise_flash_attention must be a TOML/Python boolean")
+
+    def as_dict(self) -> dict:
+        """Serializable requested options, separate from backend fallback."""
+        return {
+            "schema_version": 1,
+            "chunkwise_flash_attention": self.chunkwise_flash_attention,
+        }
+
+    def snapshot(self) -> dict:
+        """Provenance and values for run logs, not the model state_dict."""
+        return {"source_path": self.source_path, "requested": self.as_dict()}
+
+
+def load_optimization_config(
+    source: OptimizationConfig | str | Path | None = None,
+) -> OptimizationConfig:
+    """Load the default file, a chosen TOML file, or an explicit Python config.
+
+    An absent switch uses the version-1 default (True, matching v1.0 behavior).
+    An absent/invalid *file*, version, or unknown key is an error, not a silent
+    fallback. Add future switches here together with their actual call sites;
+    unsupported optimizations must not appear as enabled no-op placeholders.
+    """
+    if isinstance(source, OptimizationConfig):
+        return source
+    path = (DEFAULT_OPTIMIZATION_CONFIG if source is None else Path(source)).expanduser().resolve()
+    with path.open("rb") as stream:
+        values = tomllib.load(stream)
+    unknown = set(values) - {"schema_version", "chunkwise_flash_attention"}
+    if unknown:
+        raise ValueError(f"Unknown optimization config keys in {path}: {', '.join(sorted(unknown))}")
+    version = values.get("schema_version")
+    if type(version) is not int or version != 1:
+        raise ValueError(f"{path}: schema_version must be the integer 1")
+    return OptimizationConfig(
+        chunkwise_flash_attention=values.get("chunkwise_flash_attention", True),
+        source_path=str(path),
+    )

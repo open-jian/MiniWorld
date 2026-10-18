@@ -21,6 +21,7 @@ from miniworld.conditioning.trajectories import SUPPORTED_TRAJECTORIES, build_cu
 from miniworld.data.droid import LeRobotActionDataset
 from miniworld.data.re10k import RealEstate10KDataset
 from miniworld.denoiser import DenoiserConfig, build_denoiser_from_mode
+from miniworld.optimization_config import OptimizationConfig, load_optimization_config
 from miniworld.vae.codec import StreamingVAEDecoder, load_wan22_vae, print0, vae_encode
 
 
@@ -95,12 +96,14 @@ def resolve_custom_re10k_conditioning(args: argparse.Namespace) -> None:
     args.cond_per_token = True
 
 
-def build_denoiser(args: argparse.Namespace):
+def build_denoiser(args: argparse.Namespace, *, optimization_config: OptimizationConfig | None = None):
     """Create a denoiser configured for sampling."""
     cfg_kwargs = vars(args).copy()
     cfg_kwargs.update(
         latent_size=(args.resize_h // args.spatial_downsample, args.resize_w // args.spatial_downsample),
     )
+    if optimization_config is not None:
+        cfg_kwargs["optimization_config"] = optimization_config
     cfg = DenoiserConfig(**cfg_kwargs)
     return build_denoiser_from_mode(cfg)
 
@@ -246,6 +249,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae_checkpoint", required=True)
     parser.add_argument("--sample_dir", default="samples")
     parser.add_argument("--sample_num_videos", type=int, default=8)
+    parser.add_argument(
+        "--optimization_config",
+        default=None,
+        help="Inference optimization TOML file; defaults to optimization_config.toml in this checkout. "
+             "Read once per model; sampling/window/precision settings are separate.",
+    )
 
     parser.add_argument(
         "--wm_model",
@@ -323,6 +332,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run streaming sampling."""
     args = parse_args()
+    # Validate before loading data/checkpoints/VAE. Pass this same immutable
+    # snapshot into the model so a mid-startup file edit cannot change the run.
+    optimizations = load_optimization_config(args.optimization_config)
+    print0(f"[Optimizations] {json.dumps(optimizations.snapshot(), ensure_ascii=False)}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
@@ -342,7 +355,7 @@ def main() -> None:
     args.latent_frames = resolve_latent_frames(weights, meta, args)
     args.wm_model = resolve_wm_model(meta, args)
     print0(f"[Checkpoint] {args.checkpoint}: wm_model={args.wm_model}, latent_frames={args.latent_frames}")
-    denoiser = build_denoiser(args).to(device).eval()
+    denoiser = build_denoiser(args, optimization_config=optimizations).to(device).eval()
     load_weights(weights, denoiser)
     if int(meta.get("trained_num_frames", 0)) > 0:
         denoiser.trained_num_frames = int(meta["trained_num_frames"])
@@ -351,6 +364,13 @@ def main() -> None:
     sample_root = Path(args.sample_dir)
     pred_root = sample_root / "pred"
     pred_root.mkdir(parents=True, exist_ok=True)
+    # Save actual loaded values, not a later reread of a mutable config file.
+    # 'requested' deliberately does not claim FlashAttention ran on an
+    # unsupported device/dtype; the original forward guards still apply.
+    (sample_root / "optimization_config.json").write_text(
+        json.dumps(denoiser.net.optimization_config.snapshot(), indent=2) + "\n",
+        encoding="utf-8",
+    )
     timing_rows = []
 
     for idx, batch in enumerate(dataloader):
@@ -419,4 +439,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

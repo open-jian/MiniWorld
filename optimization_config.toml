@@ -1,0 +1,11 @@
+# Central inference optimization switches, read once when a model is created.
+# Create a new model after editing this file for changes to take effect.
+# Include only optimizations implemented in this branch. Sink, window size,
+# sampling steps, and precision are configured separately.
+# Extend miniworld/optimization_config.py when adding a switch; unknown keys fail.
+schema_version = 1
+
+# true: request Chunkwise FlashAttention; false: use the original masked SDPA.
+# When true, existing fallbacks for CPU, FP32, and unsupported GPUs/head_dim apply.
+# Affects only chunk-causal attention in forward_with_cache, not training attention.
+chunkwise_flash_attention = true

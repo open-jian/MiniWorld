@@ -195,6 +195,30 @@ cat /path/to/re10k_download/datasets/RealEstate10K_Full.tar.gz.part-* \
 
 生成的视频保存在 `${SAMPLE_DIR}/pred/`。
 
+推理优化统一由仓库根目录的 [`optimization_config.toml`](optimization_config.toml)
+控制。v1.0 当前只有已实现的 Chunkwise FlashAttention 开关，默认保持开启：
+
+```toml
+schema_version = 1
+chunkwise_flash_attention = true
+```
+
+改为 `false` 后，流式 `forward_with_cache` 使用原来的带 mask SDPA。
+`true` 表示请求开启，CPU、FP32 或不支持的硬件/head_dim 仍按原逻辑回退。
+配置不包含 sink、窗口、采样步数或精度；后续优化实现时再加入对应开关。
+
+直接运行采样入口时可加 `--optimization_config /path/to/experiment.toml`；
+上述 DROID、RE10K 采样脚本和吞吐脚本支持 `OPTIMIZATION_CONFIG=/path/to/experiment.toml`。
+Python 调用可以向 `DenoiserConfig` 或 `MiniWorldModel` 传入
+`optimization_config="/path/to/experiment.toml"`。不指定时使用当前代码仓库内的默认文件，
+不依赖启动目录。每个模型只在创建时读取一次；修改文件后需重新创建模型。
+
+优先级为：`forward_with_cache(use_chunk_flash_attn=True/False)` 的显式单次覆盖
+> 模型已加载的配置。省略该参数（或传 `None`）则继承配置；已有 A/B benchmark 的
+显式覆盖仍有效。未知字段、非布尔开关、错误版本或不存在的文件会报错。
+采样启动日志及 `${SAMPLE_DIR}/optimization_config.json` 保存本次实际加载的配置快照，
+Python 流式推理的 `last_eval_meta["optimization_config"]` 也记录相同信息。
+
 ### DROID 动作条件生成
 
 ```bash

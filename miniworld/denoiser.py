@@ -64,6 +64,9 @@ class DenoiserConfig:
         self.wm_mlp_ratio: float = 4.0
         self.wm_use_qknorm: bool = True
         self.wm_use_checkpoint: bool = True
+        # File path / OptimizationConfig / None (repository default). This must
+        # be declared because unknown constructor kwargs are otherwise ignored.
+        self.optimization_config = None
         self.cond_dim: int = 0
         # When True, y is treated as per-token spatial conditioning
         # ``(B, T, cond_dim, H_lat, W_lat)`` (e.g. ray-encoding for camera
@@ -141,6 +144,7 @@ class Denoiser(nn.Module):
             adaln_mode=cfg.adaln_mode,
             cond_dropout_prob=cfg.cond_dropout_prob,
             action_null_first=cfg.action_null_first,
+            optimization_config=cfg.optimization_config,
         )
 
         self.trained_num_frames = (
@@ -843,6 +847,7 @@ class DiffusionForcingDenoiser(Denoiser):
             )
             self.last_eval_meta["cfg_enabled"] = bool(use_cfg)
             self.last_eval_meta["stream_timing_enabled"] = bool(timing_enabled)
+            self.last_eval_meta["optimization_config"] = net.optimization_config.snapshot()
             _print0(f"[StreamingGen] total_len={total_len}, total_chunks={total_chunks}, "
                     f"ctx_chunks={n_full_ctx_chunks}, chunk_size={chunk_size}, "
                     f"inflight_chunks={inflight_chunks}, max_cache_chunks={max_cache_chunks}, "

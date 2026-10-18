@@ -198,6 +198,35 @@ The default sampler uses:
 
 Generated videos are saved to `${SAMPLE_DIR}/pred/`.
 
+Inference optimization switches live in the repository's
+[`optimization_config.toml`](optimization_config.toml). Version 1.0 currently
+implements Chunkwise FlashAttention only, enabled by default:
+
+```toml
+schema_version = 1
+chunkwise_flash_attention = true
+```
+
+Set it to `false` to use the original masked SDPA in `forward_with_cache`.
+`true` requests the optimized path; existing CPU/FP32/device/head-dimension
+fallbacks still apply. Sink, window, sampling steps and precision remain in
+their existing configuration. New optimization switches are added when implemented.
+
+Select another file with `python -m miniworld.sample --optimization_config
+/path/to/experiment.toml` plus the usual sampling arguments, or set
+`OPTIMIZATION_CONFIG=/path/to/experiment.toml` for the DROID/RE10K sample and
+throughput scripts. Python callers may pass `optimization_config=path` to
+`DenoiserConfig` or `MiniWorldModel`. The default file is resolved relative to
+this checkout, independently of the working directory. Each model loads one
+immutable snapshot at construction; recreate the model after editing the file.
+
+An explicit `forward_with_cache(use_chunk_flash_attn=True/False)` overrides the
+model configuration for that call, preserving existing A/B benchmarks. Omitting
+it (or passing `None`) inherits the configuration. Unknown keys, non-boolean
+switches, invalid versions and missing files fail explicitly. Startup logs and
+`${SAMPLE_DIR}/optimization_config.json` record the loaded snapshot; direct
+streaming callers can inspect `last_eval_meta["optimization_config"]`.
+
 ### DROID action-conditioned generation
 
 ```bash
@@ -463,4 +492,3 @@ If you find MiniWorld useful in your research, please cite:
   year    = {2026}
 }
 ```
-
