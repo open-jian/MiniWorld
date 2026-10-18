@@ -43,6 +43,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
             "schema_version": 1,
             "chunkwise_flash_attention": False,
             "framewise_conditioning": True,
+            "fused_norm_modulation": True,
         }
         for config in (from_path, from_string, from_instance):
             self.assertEqual(config.as_dict(), expected)
@@ -53,6 +54,27 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
         self.write_config("schema_version = 1\n")
         self.assertIs(load_optimization_config(self.path).chunkwise_flash_attention, True)
         self.assertIs(load_optimization_config(self.path).framewise_conditioning, True)
+        self.assertIs(load_optimization_config(self.path).fused_norm_modulation, True)
+
+    def test_fused_norm_is_independent_and_serialized(self):
+        self.assertIs(OptimizationConfig().fused_norm_modulation, True)
+        self.write_config(
+            "schema_version = 1\n"
+            "fused_norm_modulation = false\n"
+        )
+        config = load_optimization_config(self.path)
+        self.assertIs(config.fused_norm_modulation, False)
+        self.assertIs(config.framewise_conditioning, True)
+        self.assertIs(config.chunkwise_flash_attention, True)
+        self.assertIs(config.snapshot()["requested"]["fused_norm_modulation"], False)
+        self.write_config(
+            "schema_version = 1\nchunkwise_flash_attention = false\n"
+            "framewise_conditioning = false\nfused_norm_modulation = true\n"
+        )
+        config = load_optimization_config(self.path)
+        self.assertIs(config.fused_norm_modulation, True)
+        self.assertIs(config.framewise_conditioning, False)
+        self.assertIs(config.chunkwise_flash_attention, False)
 
     def test_framewise_conditioning_is_independent_and_enabled_by_default(self):
         # File and Python defaults agree; an explicit false selects the baseline.
@@ -93,7 +115,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
     def test_strings_and_numbers_are_not_boolean_switches(self):
         # bool("false") and bool(1) would both silently turn the switch on.
-        for name in ("chunkwise_flash_attention", "framewise_conditioning"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation"):
             for value in ('"false"', "0", "1", "[]"):
                 with self.subTest(name=name, value=value):
                     self.write_config(f"schema_version = 1\n{name} = {value}\n")
@@ -101,7 +123,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
                         load_optimization_config(self.path)
 
     def test_python_config_also_rejects_non_boolean_switches(self):
-        for name in ("chunkwise_flash_attention", "framewise_conditioning"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation"):
             for value in ("false", 0, 1, None):
                 with self.subTest(name=name, value=value):
                     with self.assertRaises(TypeError):
@@ -157,7 +179,9 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
 class OptimizationConfigIntegrationTests(unittest.TestCase):
     def test_denoiser_config_forwards_explicit_optimization_config(self):
-        config = OptimizationConfig(chunkwise_flash_attention=False, framewise_conditioning=True)
+        config = OptimizationConfig(
+            chunkwise_flash_attention=False, framewise_conditioning=True, fused_norm_modulation=False,
+        )
 
         def construct(**kwargs):
             return small_model(optimization_config=kwargs["optimization_config"])
@@ -174,6 +198,7 @@ class OptimizationConfigIntegrationTests(unittest.TestCase):
         self.assertIs(factory.call_args.kwargs["optimization_config"], config)
         self.assertIs(denoiser.net.optimization_config.chunkwise_flash_attention, False)
         self.assertIs(denoiser.net.optimization_config.framewise_conditioning, True)
+        self.assertIs(denoiser.net.optimization_config.fused_norm_modulation, False)
 
     def test_per_call_override_rejects_ambiguous_values(self):
         model = small_model(optimization_config=OptimizationConfig(False))

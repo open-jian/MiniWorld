@@ -26,12 +26,33 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-MODES = ("original", "framewise")
+CANDIDATE = "framewise"
+SWITCH_NAME = "framewise_conditioning"
+COMPARISON_LABEL = "Framewise conditioning"
+SHORT_LABEL = "Framewise"
+FIXED_OPTIMIZATIONS = {"chunkwise_flash_attention": True}
+MODES = ("original", CANDIDATE)
 METRICS = ("PSNR", "SSIM", "LPIPS")
 LABELS = {"PSNR": "PSNR (dB, higher is better)",
           "SSIM": "SSIM (higher is better)",
           "LPIPS": "LPIPS (lower is better)"}
 COLORS = {"original": "#3668a8", "framewise": "#df761d"}
+
+
+def configure_comparison(candidate, switch_name, label, short_label, fixed_optimizations):
+    """Reuse the archived analysis with an explicitly named comparison."""
+    global CANDIDATE, SWITCH_NAME, COMPARISON_LABEL, SHORT_LABEL, FIXED_OPTIMIZATIONS, MODES, COLORS
+    CANDIDATE, SWITCH_NAME = candidate, switch_name
+    COMPARISON_LABEL, SHORT_LABEL = label, short_label
+    FIXED_OPTIMIZATIONS = dict(fixed_optimizations)
+    MODES = ("original", CANDIDATE)
+    COLORS = {"original": "#3668a8", CANDIDATE: "#df761d"}
+
+
+def delta_key(field):
+    return f"delta_{field}_{CANDIDATE}_minus_original"
+
+
 TIMING_SCOPE = "Generation + streaming VAE decode; prepared GPU inputs to decoded RGB"
 TIMING_EXCLUDES = "Input/model loading, VAE encoding, warmup, file saving, and quality metrics"
 SAMPLING = {"history_len": 1, "max_cache_chunks": 24, "inflight_chunks": 8,
@@ -110,8 +131,11 @@ def analyze_episode(path):
         requested = meta.get("optimization_config", {}).get("requested", {})
         if requested.get("chunkwise_flash_attention") is not True:
             issues.append(f"{mode}: Chunkwise FlashAttention was not enabled in the model snapshot")
-        if requested.get("framewise_conditioning") is not enabled:
-            issues.append(f"{mode}: unexpected framewise_conditioning value in model snapshot")
+        if requested.get(SWITCH_NAME) is not enabled:
+            issues.append(f"{mode}: unexpected {SWITCH_NAME} value in model snapshot")
+        for key, expected in FIXED_OPTIMIZATIONS.items():
+            if requested.get(key) is not expected:
+                issues.append(f"{mode}: unexpected fixed {key} value in model snapshot")
         if meta.get("effective_steps") != 40:
             issues.append(f"{mode}: expected 40 effective sampler steps, got {meta.get('effective_steps')}")
         elapsed = float(run["generation_stream_decode_seconds"])
@@ -141,19 +165,19 @@ def analyze_episode(path):
                 issues.append(f"{mode}: recomputed {metric} differs from quality_summary.csv")
     old, new = (result["implementations"][mode] for mode in MODES)
     old_config, new_config = (dict(item["requested_optimization_config"]) for item in (old, new))
-    old_config.pop("framewise_conditioning", None)
-    new_config.pop("framewise_conditioning", None)
+    old_config.pop(SWITCH_NAME, None)
+    new_config.pop(SWITCH_NAME, None)
     if old_config != new_config:
-        issues.append("Optimization configurations differ beyond the framewise_conditioning switch")
+        issues.append(f"Optimization configurations differ beyond the {SWITCH_NAME} switch")
     if report.get("quality", {}).get("latent_error", {}).get("finite") is not True:
         issues.append("Missing or failed finite check for the paired generated latent outputs")
     for field in ("mean_quality", "first_quarter_quality", "last_quarter_quality"):
-        result[f"delta_{field}_framewise_minus_original"] = {
+        result[delta_key(field)] = {
             metric: delta(new[field][metric], old[field][metric]) for metric in METRICS
         }
     result["last_minus_first_quarter_change_in_delta"] = {
-        metric: delta(result["delta_last_quarter_quality_framewise_minus_original"][metric],
-                      result["delta_first_quarter_quality_framewise_minus_original"][metric])
+        metric: delta(result[delta_key("last_quarter_quality")][metric],
+                      result[delta_key("first_quarter_quality")][metric])
         for metric in METRICS
     }
     a, b = (item["generation_stream_decode_seconds"] for item in (old, new))
@@ -186,7 +210,7 @@ def aggregate(episodes, expected):
         "episode_ids": [item["episode"] for item in episodes],
         "timing_scope": TIMING_SCOPE, "timing_excludes": TIMING_EXCLUDES,
         "quality_averaging": "Arithmetic per-frame average excludes observation frame 0; macro average weights each episode equally",
-        "delta_definition": "Framewise ON minus OFF; positive PSNR/SSIM and negative LPIPS indicate improvement",
+        "delta_definition": f"{SHORT_LABEL} ON minus OFF; positive PSNR/SSIM and negative LPIPS indicate improvement",
         "tail_definition": "Fourth np.array_split quarter of predicted RGB frame indices; compare paired ON-minus-OFF deltas across quarters",
         "history_window_definition": "Historical chunks only; excludes the sink and chunks currently being denoised",
         "history_capacity_chunks_excluding_sink": 23.5,
@@ -197,8 +221,8 @@ def aggregate(episodes, expected):
                         "No quality acceptance threshold was specified; raw deltas do not establish equivalence",
                         "Late-minus-early quality deltas are descriptive and do not alone identify error accumulation"],
         "macro_average": macro,
-        "macro_quality_delta_framewise_minus_original": {
-            metric: delta(macro["framewise"]["mean_quality"][metric], macro["original"]["mean_quality"][metric])
+        f"macro_quality_delta_{CANDIDATE}_minus_original": {
+            metric: delta(macro[CANDIDATE]["mean_quality"][metric], macro["original"]["mean_quality"][metric])
             for metric in METRICS},
         "ratio_of_total_generation_stream_decode_times": a / b if a and b else None,
         "mean_per_episode_speedup": mean(item["generation_stream_decode_speedup"] for item in episodes),
@@ -227,7 +251,7 @@ def write_outputs(destination, summary, frames):
                     row[f"{mode}_{segment}_{metric}"] = run[segment][metric]
         for segment in ("mean_quality", "first_quarter_quality", "last_quarter_quality"):
             for metric in METRICS:
-                row[f"delta_{segment}_{metric}"] = item[f"delta_{segment}_framewise_minus_original"][metric]
+                row[f"delta_{segment}_{metric}"] = item[delta_key(segment)][metric]
         for metric in METRICS:
             row[f"last_minus_first_quarter_change_in_delta_{metric}"] = item["last_minus_first_quarter_change_in_delta"][metric]
         rows.append(row)
@@ -235,7 +259,7 @@ def write_outputs(destination, summary, frames):
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    lines = ["Framewise conditioning: paired OFF / ON validation", "",
+    lines = [f"{COMPARISON_LABEL}: paired OFF / ON validation", "",
              f"Episodes: {', '.join(summary['episode_ids'])}",
              "Chunkwise FlashAttention enabled in both model configurations.",
              "Quality: arithmetic means over predicted RGB frames, excluding observation frame 0.",
@@ -244,7 +268,7 @@ def write_outputs(destination, summary, frames):
              "Episode  OFF seconds  ON seconds  Speedup  Delta PSNR (dB)  Delta SSIM  Delta LPIPS"]
     for item in summary["episodes"]:
         a, b = (item["implementations"][mode]["generation_stream_decode_seconds"] for mode in MODES)
-        differences = item["delta_mean_quality_framewise_minus_original"]
+        differences = item[delta_key("mean_quality")]
         lines.append(f"{item['episode']}  {format_number(a, 3)}  {format_number(b, 3)}  "
                      f"{format_number(item['generation_stream_decode_speedup'], 3)}x  "
                      + "  ".join(format_number(differences[metric]) for metric in METRICS))
@@ -255,7 +279,7 @@ def write_outputs(destination, summary, frames):
     lines.extend([f"Ratio of total generation + decode times: {format_number(summary['ratio_of_total_generation_stream_decode_times'], 3)}x",
                   "", "Last-quarter deltas (ON minus OFF), followed by last-minus-first-quarter change in delta:"])
     for item in summary["episodes"]:
-        tail = item["delta_last_quarter_quality_framewise_minus_original"]
+        tail = item[delta_key("last_quarter_quality")]
         change = item["last_minus_first_quarter_change_in_delta"]
         lines.append(f"{item['episode']}: " + "; ".join(
             f"{metric} {format_number(tail[metric])} (change {format_number(change[metric])})" for metric in METRICS))
@@ -278,7 +302,7 @@ def plot_quality(destination, summary, frames):
             for mode in MODES:
                 axis.plot(indices, [frames[episode][mode][int(index)][metric] for index in indices],
                           color=COLORS[mode], linewidth=0.8, alpha=0.85,
-                          label=f"Framewise {'OFF' if mode == 'original' else 'ON'}")
+                          label=f"{SHORT_LABEL} {'OFF' if mode == 'original' else 'ON'}")
             axis.axvspan(*item["last_quarter_rgb_frames"], color="#888888", alpha=0.08, label="Last quarter")
             axis.set_title(f"Episode {episode} | {metric}")
             axis.set_xlabel("RGB frame index (observation frame 0 excluded)")
@@ -308,7 +332,7 @@ def plot_comparison(destination, summary):
                 values = [item["implementations"][mode]["mean_quality"][metric] for item in episodes]
                 values.append(summary["macro_average"][mode]["mean_quality"][metric])
             axis.bar(positions + offset, [np.nan if value is None else value for value in values],
-                     width=0.38, color=COLORS[mode], label=f"Framewise {'OFF' if mode == 'original' else 'ON'}")
+                     width=0.38, color=COLORS[mode], label=f"{SHORT_LABEL} {'OFF' if mode == 'original' else 'ON'}")
         axis.set_xticks(positions, labels)
         axis.set_ylabel("Generation + streaming decode (seconds)" if metric == "seconds" else LABELS[metric])
         axis.set_title("Generation + decode latency" if metric == "seconds" else f"Mean {metric} over predicted frames")
@@ -320,7 +344,7 @@ def plot_comparison(destination, summary):
                 axis.text(index, 0.98, f"{format_number(speedup, 3)}x", transform=axis.get_xaxis_transform(), ha="center", va="top", fontsize=9)
     handles, names = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, names, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 0.96))
-    fig.suptitle("Framewise conditioning OFF / ON | Chunkwise FlashAttention ON in both paths", fontsize=13)
+    fig.suptitle(f"{COMPARISON_LABEL} OFF / ON | Chunkwise FlashAttention ON in both paths", fontsize=13)
     fig.text(0.5, 0.014, "Quality excludes observation frame 0. Timing excludes input/model loading, VAE encoding, warmup, saving, and metrics.\n"
              "One timed rollout per path per episode. Macro mean weights episodes equally; no quality acceptance threshold assumed.",
              ha="center", fontsize=9)
@@ -331,7 +355,9 @@ def plot_comparison(destination, summary):
 
 def plot_contact_sheet(path, destination, episode):
     """Read only a few frames from memory-mapped RGB arrays, never entire videos."""
-    paths = [path.parent.parent / "prepared" / "gt_rgb.npy"] + [
+    report = json.loads(path.read_text())
+    prepared = Path(report.get("prepared_dir", path.parent.parent / "prepared"))
+    paths = [prepared / "gt_rgb.npy"] + [
         path.parent / f"{mode}_rgb.npy" for mode in MODES
     ]
     if not all(item.is_file() for item in paths):
@@ -342,7 +368,7 @@ def plot_contact_sheet(path, destination, episode):
     if last < 496:
         indices = sorted(set(np.linspace(1, last, min(5, last), dtype=int).tolist()))
     fig, axes = plt.subplots(3, len(indices), figsize=(3.5 * len(indices), 8.2), squeeze=False)
-    row_labels = ("GT", "Framewise OFF", "Framewise ON")
+    row_labels = ("GT", f"{SHORT_LABEL} OFF", f"{SHORT_LABEL} ON")
     for row, (array, label) in enumerate(zip(arrays, row_labels)):
         for column, index in enumerate(indices):
             axis = axes[row, column]

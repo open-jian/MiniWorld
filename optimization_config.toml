@@ -18,3 +18,10 @@ chunkwise_flash_attention = true
 # Smaller GEMMs can change BF16 rounding; precision settings are not changed.
 # Enabled by default; set false to use the original tokenwise projection path.
 framewise_conditioning = true
+
+# Fuse hidden-state RMSNorm and AdaLN in eligible cached CUDA inference calls.
+# Read the actual channel-major strides without copying the residual tensor.
+# Preserve FP32 statistics/weights, epsilon, and intermediate BF16 rounding.
+# Training, gradient-enabled calls, and unsupported inputs use the reference path.
+# Reduction order may still differ; false selects the original separate operations.
+fused_norm_modulation = true

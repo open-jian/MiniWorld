@@ -31,10 +31,12 @@ class OptimizationConfig:
     source_path: str | None = field(default=None, repr=False, compare=False)
     # Disable explicitly for the reference path; GEMM shape affects BF16 rounding.
     framewise_conditioning: bool = True
+    # Fuse only supported cached inference calls; reference arithmetic remains available.
+    fused_norm_modulation: bool = True
 
     def __post_init__(self) -> None:
         # bool("false") is True: never coerce strings/numbers into switches.
-        for name in ("chunkwise_flash_attention", "framewise_conditioning"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a TOML/Python boolean")
 
@@ -44,6 +46,7 @@ class OptimizationConfig:
             "schema_version": 1,
             "chunkwise_flash_attention": self.chunkwise_flash_attention,
             "framewise_conditioning": self.framewise_conditioning,
+            "fused_norm_modulation": self.fused_norm_modulation,
         }
 
     def snapshot(self) -> dict:
@@ -56,7 +59,7 @@ def load_optimization_config(
 ) -> OptimizationConfig:
     """Load the default file, a chosen TOML file, or an explicit Python config.
 
-    Absent switches use the current defaults (both optimizations enabled).
+    Absent switches use the current defaults (implemented optimizations enabled).
     Set a switch to False explicitly when a reference execution path is needed.
     An absent/invalid *file*, version, or unknown key is an error, not a silent
     fallback. Add future switches here together with their actual call sites;
@@ -67,7 +70,9 @@ def load_optimization_config(
     path = (DEFAULT_OPTIMIZATION_CONFIG if source is None else Path(source)).expanduser().resolve()
     with path.open("rb") as stream:
         values = tomllib.load(stream)
-    unknown = set(values) - {"schema_version", "chunkwise_flash_attention", "framewise_conditioning"}
+    unknown = set(values) - {
+        "schema_version", "chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation",
+    }
     if unknown:
         raise ValueError(f"Unknown optimization config keys in {path}: {', '.join(sorted(unknown))}")
     version = values.get("schema_version")
@@ -77,4 +82,5 @@ def load_optimization_config(
         chunkwise_flash_attention=values.get("chunkwise_flash_attention", True),
         source_path=str(path),
         framewise_conditioning=values.get("framewise_conditioning", True),
+        fused_norm_modulation=values.get("fused_norm_modulation", True),
     )

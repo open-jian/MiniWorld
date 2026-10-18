@@ -202,6 +202,7 @@ cat /path/to/re10k_download/datasets/RealEstate10K_Full.tar.gz.part-* \
 schema_version = 1
 chunkwise_flash_attention = true
 framewise_conditioning = true
+fused_norm_modulation = true
 ```
 
 将 `chunkwise_flash_attention` 改为 `false` 后，流式 `forward_with_cache` 使用原来的带 mask SDPA。
@@ -217,6 +218,15 @@ framewise_conditioning = true
 每次前向（包括各去噪步和 CFG 分支）重新计算，checkpoint 字段不变。
 较小的 GEMM 可能改变 BF16 舍入结果，需对实际任务验证画质。
 仓库配置、Python 配置以及省略该字段时均默认开启；显式设为 `false` 可使用原来的逐 token 投影路径。
+
+`fused_norm_modulation = true` 将各 block 和输出层的 hidden-state RMSNorm 与
+AdaLN 合并为两个 Triton kernel，直接读取原有 channel-major 特征排列，不复制整个
+张量来调整布局。保留 FP32 统计与权重、原 epsilon，以及归一化结果和 `1 + scale`
+的 BF16 舍入；归约顺序仍可能造成少量数值差异。仅用于关闭梯度的 cached eval、
+CUDA BF16 特征、FP32 norm 权重及支持的逐 token／逐帧调制布局。
+不支持的输入或未安装 Triton 时保留原计算路径，运行错误不会被静默忽略。
+Q/K norm、条件编码 norm 和残差相加保持独立。显式设为 `false` 可以在保留其他
+优化的同时单独比较融合效果。
 
 直接运行采样入口时可加 `--optimization_config /path/to/experiment.toml`；
 上述 DROID、RE10K 采样脚本和吞吐脚本支持 `OPTIMIZATION_CONFIG=/path/to/experiment.toml`。

@@ -36,6 +36,7 @@ def conditioning_model(enabled, *, mode="adaln_lora", pose=False, device="cpu"):
         optimization_config=OptimizationConfig(
             chunkwise_flash_attention=True,
             framewise_conditioning=enabled,
+            fused_norm_modulation=False,
         ),
     )
     with torch.no_grad():

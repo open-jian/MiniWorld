@@ -43,6 +43,7 @@ from torch.utils.checkpoint import checkpoint
 from flash_attn import flash_attn_func
 
 from miniworld.optimization_config import OptimizationConfig, load_optimization_config
+from miniworld.fused_norm_modulation import can_fuse_norm_modulation, fused_norm_modulation
 
 # FlexAttention is optional; disabled by default
 create_block_mask = None
@@ -176,6 +177,26 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self._norm(x.float()).type_as(x) * self.weight
+
+
+def _norm_modulate(
+    norm: RMSNorm, x: Tensor, shift: Optional[Tensor], scale: Tensor,
+    conditioning_tokens_per_frame: Optional[int] = None, use_fused: bool = False,
+) -> Tensor:
+    """Fuse only eligible inference inputs; keep the reference path differentiable."""
+    # Custom RMSNorm instances may use zero or non-scalar epsilon. Keep those
+    # supported eager semantics instead of passing them to the narrower kernel.
+    supported_epsilon = isinstance(norm.eps, (int, float)) and math.isfinite(norm.eps) and norm.eps > 0
+    if use_fused and supported_epsilon and can_fuse_norm_modulation(
+        x, norm.weight, shift, scale, conditioning_tokens_per_frame,
+    ):
+        # The kernel preserves the BF16 rounding before the FP32 learned weight,
+        # and reads the patch embedder's channel-major layout without a copy.
+        # Q/K and conditioning-embedding norms are deliberately separate sites.
+        return fused_norm_modulation(
+            x, norm.weight, shift, scale, norm.eps, conditioning_tokens_per_frame,
+        )
+    return modulate(norm(x), shift, scale, conditioning_tokens_per_frame)
 
 
 class SwiGLUFFN(nn.Module):
@@ -616,12 +637,16 @@ class MiniWorldBlock(nn.Module):
         return_kv: bool = False,
         cached_chunk_tokens: Optional[int] = None,
         conditioning_tokens_per_frame: Optional[int] = None,
+        use_fused_norm_modulation: bool = False,
     ):
         mod = self.modulation(emb, shared_mod, pose_mod, conditioning_tokens_per_frame)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
 
         attn_result = self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa, conditioning_tokens_per_frame),
+            _norm_modulate(
+                self.norm1, x, shift_msa, scale_msa,
+                conditioning_tokens_per_frame, use_fused_norm_modulation,
+            ),
             rope=feat_rope,
             attn_mask=attn_mask,
             past_kv=past_kv,
@@ -633,7 +658,10 @@ class MiniWorldBlock(nn.Module):
         else:
             attn_out, new_kv = attn_result, None
         x = x + _apply_gate(attn_out, gate_msa, conditioning_tokens_per_frame)
-        mlp_out = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp, conditioning_tokens_per_frame))
+        mlp_out = self.mlp(_norm_modulate(
+            self.norm2, x, shift_mlp, scale_mlp,
+            conditioning_tokens_per_frame, use_fused_norm_modulation,
+        ))
         x = x + _apply_gate(mlp_out, gate_mlp, conditioning_tokens_per_frame)
         if return_kv:
             return x, new_kv
@@ -649,6 +677,7 @@ class FinalLayer(nn.Module):
 
     def forward(
         self, x: Tensor, emb: Tensor, conditioning_tokens_per_frame: Optional[int] = None,
+        use_fused_norm_modulation: bool = False,
     ) -> Tensor:
         cond = self.adaLN_modulation(emb)
         if conditioning_tokens_per_frame is not None:
@@ -657,7 +686,10 @@ class FinalLayer(nn.Module):
             shift, scale = cond.chunk(2, dim=1)
         else:
             shift, scale = cond.chunk(2, dim=-1)
-        return self.linear(modulate(self.norm(x), shift, scale, conditioning_tokens_per_frame))
+        return self.linear(_norm_modulate(
+            self.norm, x, shift, scale,
+            conditioning_tokens_per_frame, use_fused_norm_modulation,
+        ))
 
 
 # --------------------------------------------------------------------------- #
@@ -1106,6 +1138,10 @@ class MiniWorldModel(nn.Module):
             and (t.dim() == 1 or (t.dim() == 2 and t.shape[1] == grid_t_cur))
         )
         conditioning_tokens_per_frame = tokens_per_frame if framewise else None
+        # Keep ordinary forward/training on the original autograd path. The
+        # per-call predicate also rejects enabled gradients and unsupported
+        # layouts/dtypes instead of silently copying or lowering precision.
+        use_fused_norm_modulation = self.optimization_config.fused_norm_modulation and not self.training
         frame_ids = torch.arange(n_cur, device=x.device, dtype=torch.long) // tokens_per_frame
         emb_tok, shared_mod_tok, pose_mod_tok = self._build_conditioning(
             t, y, b, grid_t_cur, n_cur, frame_ids, x.device, x.dtype, cond_drop,
@@ -1120,13 +1156,17 @@ class MiniWorldModel(nn.Module):
                 past_kv_list[idx], return_kv,
                 cached_chunk_tokens=cached_chunk_tokens,
                 conditioning_tokens_per_frame=conditioning_tokens_per_frame,
+                use_fused_norm_modulation=use_fused_norm_modulation,
             )
             if return_kv:
                 x, new_kv_list[idx] = out
             else:
                 x = out
 
-        x = self.final_layer(x, emb_tok, conditioning_tokens_per_frame)
+        x = self.final_layer(
+            x, emb_tok, conditioning_tokens_per_frame,
+            use_fused_norm_modulation=use_fused_norm_modulation,
+        )
         c_out = self.out_channels
         x_vid = x.reshape(b, grid_t_cur, grid_h, grid_w, p_t, p_h, p_w, c_out)
         x_vid = torch.einsum("nthwpqrc->nctphqwr", x_vid)

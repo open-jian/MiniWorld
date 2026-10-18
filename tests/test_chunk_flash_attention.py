@@ -33,7 +33,7 @@ def small_model(device="cpu", head_dim=32, optimization_config=None):
         adaln_lora_dim=8,
         # Test semantics must not depend on a user's editable default file.
         optimization_config=(
-            OptimizationConfig(framewise_conditioning=False)
+            OptimizationConfig(framewise_conditioning=False, fused_norm_modulation=False)
             if optimization_config is None else optimization_config
         ),
     )

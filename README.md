@@ -205,6 +205,7 @@ Inference optimization switches live in the repository's
 schema_version = 1
 chunkwise_flash_attention = true
 framewise_conditioning = true
+fused_norm_modulation = true
 ```
 
 Set `chunkwise_flash_attention` to `false` to use the original masked SDPA in `forward_with_cache`.
@@ -225,6 +226,19 @@ Smaller GEMMs can change BF16 rounding without changing precision settings, so
 quality should be checked for each workload. The switch is enabled by default
 in the repository file, Python configuration, and when the key is omitted.
 Set it explicitly to `false` to use the original tokenwise projection path.
+
+`fused_norm_modulation = true` combines each block's hidden-state RMSNorm and
+AdaLN, plus the final layer's norm/modulation, using two Triton kernels. It reads
+the channel-major residual directly without a full-tensor layout copy. The
+kernel keeps FP32 statistics and learned weights, the configured epsilon, and
+BF16 rounding before the learned weight and after `1 + scale`. Reduction order
+may still cause small numerical differences. It applies only to cached eval
+calls with gradients disabled, CUDA BF16 channel-major residuals, FP32 norm
+weights, and supported dense or compact modulation. Unsupported inputs and
+installations without Triton retain the reference operations; execution errors
+are not silently hidden. Q/K norms, conditioning norms, and residual additions
+are separate operations. Set this switch to `false` for an isolated reference
+comparison while keeping the other optimizations enabled.
 
 Select another file with `python -m miniworld.sample --optimization_config
 /path/to/experiment.toml` plus the usual sampling arguments, or set

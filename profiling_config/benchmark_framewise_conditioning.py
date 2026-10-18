@@ -46,7 +46,22 @@ from miniworld.vae.codec import StreamingVAEDecoder, load_wan22_vae  # noqa: E40
 PREPARED_DIR = Path(
     "/data2/jian/output/Miniworld/DROID_long_horizon/chunk_flash_attention/episode_002352"
 )
-MODES = {"original": False, "framewise": True}
+CANDIDATE = "framewise"
+SWITCH_NAME = "framewise_conditioning"
+COMPARISON_LABEL = "Framewise conditioning"
+FIXED_OPTIMIZATIONS = {"chunkwise_flash_attention": True, "fused_norm_modulation": False}
+MODES = {"original": False, CANDIDATE: True}
+
+
+def configure_comparison(candidate, switch_name, label, fixed_optimizations):
+    """Configure the shared protocol before parsing or constructing any models."""
+    global CANDIDATE, SWITCH_NAME, COMPARISON_LABEL, FIXED_OPTIMIZATIONS, MODES
+    if candidate == "original" or switch_name in fixed_optimizations:
+        raise ValueError("The candidate and varied switch must be distinct from the fixed settings")
+    CANDIDATE, SWITCH_NAME, COMPARISON_LABEL = candidate, switch_name, label
+    FIXED_OPTIMIZATIONS = dict(fixed_optimizations)
+    MODES = {"original": False, CANDIDATE: True}
+
 # Validate the archived protocol instead of silently substituting sampler defaults.
 SAMPLING_SETTINGS = {
     "history_len": 1, "stream_max_cache_chunks": 24, "stream_inflight_chunks": 8,
@@ -56,8 +71,8 @@ SAMPLING_SETTINGS = {
 }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(defaults=None, description=None):
+    parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument("--checkpoint", type=Path,
                         default=Path("/data2/jian/checkpoints/miniworld/MiniWorld_1b_droid.pt"))
     parser.add_argument("--vae-checkpoint", type=Path,
@@ -77,7 +92,9 @@ def parse_args():
                         help="Skip standalone forward timing; both rollout paths still receive warmup")
     parser.add_argument("--save-videos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rollout-order", nargs=2, choices=tuple(MODES),
-                        default=["original", "framewise"])
+                        default=list(MODES))
+    if defaults:
+        parser.set_defaults(**defaults)
     args = parser.parse_args()
     if min(args.cache_latents) < 0 or min(args.current_latents) <= 0:
         parser.error("cache lengths must be nonnegative and current lengths positive")
@@ -166,7 +183,7 @@ def load_models(args, manifest):
             latent_size=(15, 20), latent_channels=48, latent_frames=trained_latents,
             cond_dim=int(weights["net.null_action"].shape[-1]), wm_use_checkpoint=False,
             optimization_config=OptimizationConfig(
-                chunkwise_flash_attention=True, framewise_conditioning=enabled,
+                **FIXED_OPTIMIZATIONS, **{SWITCH_NAME: enabled},
             ),
         )
         model = build_denoiser_from_mode(DenoiserConfig(**options))
@@ -219,7 +236,7 @@ def projection_shapes(model, call):
     return rows
 
 
-def benchmark_forward(args, models, data, report):
+def benchmark_forward(args, models, data, report, diagnostics=None):
     with torch.autocast("cuda", dtype=torch.bfloat16):
         shared = build_shared_cache(models["original"], data, max(args.cache_latents))
         for cache_length in args.cache_latents:
@@ -252,14 +269,18 @@ def benchmark_forward(args, models, data, report):
                     for name in MODES:
                         call(name)
                 baseline, baseline_kv = call("original")
-                actual, actual_kv = call("framewise")
+                actual, actual_kv = call(CANDIDATE)
                 error = _error(baseline, actual)
                 kv_error = _kv_error(baseline_kv, actual_kv) if commit else None
                 if not error["finite"]:
-                    raise RuntimeError("Framewise output contains non-finite values")
+                    raise RuntimeError(f"{COMPARISON_LABEL} output contains non-finite values")
                 del baseline, actual, baseline_kv, actual_kv
                 shapes = {name: projection_shapes(models[name], lambda name=name: call(name))
                           for name in MODES}
+                execution = {} if diagnostics is None else {
+                    name: diagnostics(name, models[name], lambda name=name: call(name))
+                    for name in MODES
+                }
                 cuda_times = {name: [] for name in MODES}
                 wall_times = {name: [] for name in MODES}
                 peak_bytes = {name: [] for name in MODES}
@@ -288,23 +309,24 @@ def benchmark_forward(args, models, data, report):
                     "return_kv": commit, "output_error": error,
                     "returned_current_kv_error": kv_error,
                     "projection_shapes": shapes,
+                    "execution_diagnostics": execution,
                     "cuda": {name: _summarize(values) for name, values in cuda_times.items()},
                     "wall": {name: _summarize(values) for name, values in wall_times.items()},
                     "peak_incremental_allocated_bytes": {name: max(values) for name, values in peak_bytes.items()},
-                    "median_speedup_cuda": statistics.median(cuda_times["original"]) / statistics.median(cuda_times["framewise"]),
-                    "median_speedup_wall": statistics.median(wall_times["original"]) / statistics.median(wall_times["framewise"]),
+                    "median_speedup_cuda": statistics.median(cuda_times["original"]) / statistics.median(cuda_times[CANDIDATE]),
+                    "median_speedup_wall": statistics.median(wall_times["original"]) / statistics.median(wall_times[CANDIDATE]),
                 }
                 report["forward_cases"].append(case)
                 dump(args.output_dir / "benchmark.json", report)
                 print(f"cache={cache_length}, current={length}: "
                       f"{case['cuda']['original']['median_ms']:.3f} -> "
-                      f"{case['cuda']['framewise']['median_ms']:.3f} ms "
+                      f"{case['cuda'][CANDIDATE]['median_ms']:.3f} ms "
                       f"({case['median_speedup_cuda']:.3f}x), relative RMSE={error['relative_rmse']:.6g}", flush=True)
     write_csv(args.output_dir / "forward_summary.csv", [{
         "history_chunks_excluding_sink": case["history_chunks_excluding_sink"],
         "current_latents": case["current_latents"], "role": case["role"],
         "original_median_ms": case["cuda"]["original"]["median_ms"],
-        "framewise_median_ms": case["cuda"]["framewise"]["median_ms"],
+        f"{CANDIDATE}_median_ms": case["cuda"][CANDIDATE]["median_ms"],
         "speedup": case["median_speedup_cuda"],
         "output_relative_rmse": case["output_error"]["relative_rmse"],
         "output_max_abs": case["output_error"]["max_abs"],
@@ -406,7 +428,9 @@ def benchmark_rollout(args, models, data, report):
             "initial_latent_preserved": bool(torch.equal(latents[:, :, :1], data["latents"][:, :, :1])),
             "shared_inputs_unmodified": all(torch.equal(data[key], original) for key, original in fixed_inputs.items()),
             "chunkwise_flash_attention_enabled": metadata["optimization_config"]["requested"]["chunkwise_flash_attention"] is True,
-            "framewise_switch_correct": metadata["optimization_config"]["requested"]["framewise_conditioning"] is MODES[name],
+            f"{CANDIDATE}_switch_correct": metadata["optimization_config"]["requested"][SWITCH_NAME] is MODES[name],
+            **{f"fixed_{key}_correct": metadata["optimization_config"]["requested"][key] is value
+               for key, value in FIXED_OPTIMIZATIONS.items()},
             "sink_argument_one_in_every_eviction": all(row["sink_latents"] == 1 for row in cache_recorder.rows),
             "cache_capacity_after_every_eviction": all(row["after_latents"] == 48 for row in cache_recorder.rows),
             "eviction_length_consistent": all(row["before_latents"] - row["after_latents"] == row["drop_latents"] for row in cache_recorder.rows),
@@ -434,7 +458,7 @@ def benchmark_rollout(args, models, data, report):
             save_video(args.output_dir / f"{name}.mp4", pixels, report["save_fps"])
         del latents, rgb, pixels
     runs = report["rollout"]["runs"]
-    report["rollout"]["speedup"] = runs["original"]["generation_stream_decode_seconds"] / runs["framewise"]["generation_stream_decode_seconds"]
+    report["rollout"]["speedup"] = runs["original"]["generation_stream_decode_seconds"] / runs[CANDIDATE]["generation_stream_decode_seconds"]
     if args.save_videos:
         count = report["rollout"]["rgb_frames"]
         arrays = [np.load(args.prepared_dir / "gt_rgb.npy", mmap_mode="r")[:count]] + [
@@ -442,7 +466,7 @@ def benchmark_rollout(args, models, data, report):
         ]
         # Concatenate one frame at a time instead of allocating a full triptych.
         import av
-        with av.open(str(args.output_dir / "gt_original_framewise.mp4"), "w") as container:
+        with av.open(str(args.output_dir / f"gt_original_{CANDIDATE}.mp4"), "w") as container:
             stream = container.add_stream("libx264", rate=report["save_fps"])
             stream.width, stream.height, stream.pix_fmt = 960, 240, "yuv420p"
             stream.options = {"crf": "18", "preset": "fast"}
@@ -500,8 +524,8 @@ def quality(args, report):
     report["quality"] = {
         "summary": summaries,
         "quarters": segments,
-        "delta_framewise_minus_original": {key: summaries[1][key] - summaries[0][key] for key in ("PSNR", "SSIM", "LPIPS")},
-        "latent_error": _error(latent["original"], latent["framewise"]),
+        f"delta_{CANDIDATE}_minus_original": {key: summaries[1][key] - summaries[0][key] for key in ("PSNR", "SSIM", "LPIPS")},
+        "latent_error": _error(latent["original"], latent[CANDIDATE]),
         "averaging": "arithmetic per-frame means excluding conditioning RGB frame 0",
         "definitions": "PSNR RGB range255; SSIM gaussian sigma1.5 win11 population covariance RGB mean; LPIPS AlexNet v0.1 FP32",
     }
@@ -509,8 +533,8 @@ def quality(args, report):
 
 
 @torch.inference_mode()
-def main():
-    args = parse_args()
+def main(args=None, report_metadata=None, forward_diagnostics=None):
+    args = args or parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if (args.output_dir / "benchmark.json").exists():
         raise FileExistsError(f"Choose a new output directory: {args.output_dir} already has benchmark.json")
@@ -526,6 +550,9 @@ def main():
         "episode": f"{int(manifest['episode']):06d}", "seed": manifest["seed"],
         "task": manifest.get("task"), "save_fps": int(manifest["args"].get("save_fps", 8)),
         "prepared_manifest": manifest,
+        "prepared_dir": str(args.prepared_dir.resolve()),
+        "comparison": {"candidate": CANDIDATE, "switch": SWITCH_NAME,
+                       "label": COMPARISON_LABEL, "fixed_optimizations": FIXED_OPTIMIZATIONS},
         "checkpoint": str(args.checkpoint.resolve()), "checkpoint_load_strict": True,
         "trained_latents": trained_latents, "tokens_per_latent": 300,
         "latent_frames_per_chunk": 2, "sink_latents": 1,
@@ -550,9 +577,11 @@ def main():
         "forward_excludes": "cache construction/eviction, sampler, CFG second pass, VAE, I/O",
         "forward_cases": [],
     }
+    if report_metadata is not None:
+        report.update(report_metadata(args, models, data))
     dump(args.output_dir / "benchmark.json", report)
     if not args.skip_forward:
-        benchmark_forward(args, models, data, report)
+        benchmark_forward(args, models, data, report, diagnostics=forward_diagnostics)
     if args.rollout_latents:
         benchmark_rollout(args, models, data, report)
         del models, data
