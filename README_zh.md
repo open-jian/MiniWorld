@@ -196,16 +196,27 @@ cat /path/to/re10k_download/datasets/RealEstate10K_Full.tar.gz.part-* \
 生成的视频保存在 `${SAMPLE_DIR}/pred/`。
 
 推理优化统一由仓库根目录的 [`optimization_config.toml`](optimization_config.toml)
-控制。v1.0 当前只有已实现的 Chunkwise FlashAttention 开关，默认保持开启：
+控制。当前默认配置：
 
 ```toml
 schema_version = 1
 chunkwise_flash_attention = true
+framewise_conditioning = true
 ```
 
-改为 `false` 后，流式 `forward_with_cache` 使用原来的带 mask SDPA。
+将 `chunkwise_flash_attention` 改为 `false` 后，流式 `forward_with_cache` 使用原来的带 mask SDPA。
 `true` 表示请求开启，CPU、FP32 或不支持的硬件/head_dim 仍按原逻辑回退。
 配置不包含 sink、窗口、采样步数或精度；后续优化实现时再加入对应开关。
+
+`framewise_conditioning = true` 将共享调制、各层 AdaLN/LoRA 和输出层条件投影
+改为每个 latent 帧计算一次，再向空间 token 广播。15×20 个 token 的情况下，
+这些投影处理的行数减少 300 倍，不代表整体推理加速 300 倍。
+调制张量保留大小为 1 的空间维度，不再物化重复的逐 token 调制张量。
+仅作用于 eval 模式下、使用全局或逐帧 timestep 的 `forward_with_cache`；
+逐 token timestep 和普通/训练 `forward` 保留原布局，空间变化的 pose 调制不折叠。
+每次前向（包括各去噪步和 CFG 分支）重新计算，checkpoint 字段不变。
+较小的 GEMM 可能改变 BF16 舍入结果，需对实际任务验证画质。
+仓库配置、Python 配置以及省略该字段时均默认开启；显式设为 `false` 可使用原来的逐 token 投影路径。
 
 直接运行采样入口时可加 `--optimization_config /path/to/experiment.toml`；
 上述 DROID、RE10K 采样脚本和吞吐脚本支持 `OPTIMIZATION_CONFIG=/path/to/experiment.toml`。

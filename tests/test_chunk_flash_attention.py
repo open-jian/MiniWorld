@@ -32,7 +32,10 @@ def small_model(device="cpu", head_dim=32, optimization_config=None):
         mlp_ratio=2,
         adaln_lora_dim=8,
         # Test semantics must not depend on a user's editable default file.
-        optimization_config=(OptimizationConfig() if optimization_config is None else optimization_config),
+        optimization_config=(
+            OptimizationConfig(framewise_conditioning=False)
+            if optimization_config is None else optimization_config
+        ),
     )
     with torch.no_grad():
         model.shared_mod[-1].weight.normal_(std=0.02)

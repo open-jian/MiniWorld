@@ -9,3 +9,12 @@ schema_version = 1
 # When true, existing fallbacks for CPU, FP32, and unsupported GPUs/head_dim apply.
 # Affects only chunk-causal attention in forward_with_cache, not training attention.
 chunkwise_flash_attention = true
+
+# Project frame-uniform timestep/action conditioning once per latent frame,
+# then broadcast modulation across spatial tokens within the same forward.
+# Applies only to eval forward_with_cache with global/per-frame timesteps;
+# per-token timesteps and training retain the original projection layout.
+# Spatial pose conditioning remains per-token. No cross-step or CFG cache is used.
+# Smaller GEMMs can change BF16 rounding; precision settings are not changed.
+# Enabled by default; set false to use the original tokenwise projection path.
+framewise_conditioning = true

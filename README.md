@@ -199,18 +199,32 @@ The default sampler uses:
 Generated videos are saved to `${SAMPLE_DIR}/pred/`.
 
 Inference optimization switches live in the repository's
-[`optimization_config.toml`](optimization_config.toml). Version 1.0 currently
-implements Chunkwise FlashAttention only, enabled by default:
+[`optimization_config.toml`](optimization_config.toml). Current defaults:
 
 ```toml
 schema_version = 1
 chunkwise_flash_attention = true
+framewise_conditioning = true
 ```
 
-Set it to `false` to use the original masked SDPA in `forward_with_cache`.
+Set `chunkwise_flash_attention` to `false` to use the original masked SDPA in `forward_with_cache`.
 `true` requests the optimized path; existing CPU/FP32/device/head-dimension
 fallbacks still apply. Sink, window, sampling steps and precision remain in
 their existing configuration. New optimization switches are added when implemented.
+
+`framewise_conditioning = true` computes shared, block AdaLN/LoRA, and final
+conditioning projections once per latent frame, then broadcasts the modulation
+over spatial tokens. At 15x20 tokens per frame, these projections process 300
+times fewer rows; this is not a claim of 300x inference speedup. The compact
+modulation uses a singleton spatial dimension instead of a dense repeated tensor.
+This applies to eval-mode `forward_with_cache` with global/per-frame timesteps.
+Per-token timesteps and ordinary/training `forward` keep the original layout;
+spatial pose modulation is never collapsed. Values are recomputed for every
+forward, including each denoising step and CFG branch. Checkpoint keys are unchanged.
+Smaller GEMMs can change BF16 rounding without changing precision settings, so
+quality should be checked for each workload. The switch is enabled by default
+in the repository file, Python configuration, and when the key is omitted.
+Set it explicitly to `false` to use the original tokenwise projection path.
 
 Select another file with `python -m miniworld.sample --optimization_config
 /path/to/experiment.toml` plus the usual sampling arguments, or set

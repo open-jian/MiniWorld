@@ -135,8 +135,18 @@ def _chunkwise_flash_attention(q: Tensor, k: Tensor, v: Tensor, chunk_tokens: in
 # --------------------------------------------------------------------------- #
 #                                 Basic layers                                 #
 # --------------------------------------------------------------------------- #
-def modulate(x: Tensor, shift: Optional[Tensor], scale: Tensor) -> Tensor:
-    """AdaLN modulation. ``shift`` / ``scale`` may be ``(B, D)`` or ``(B, N, D)``."""
+def modulate(
+    x: Tensor, shift: Optional[Tensor], scale: Tensor,
+    conditioning_tokens_per_frame: Optional[int] = None,
+) -> Tensor:
+    """Apply AdaLN, optionally broadcasting compact (B, T, 1, D) modulation."""
+    if conditioning_tokens_per_frame is not None:
+        # Tokens are ordered by (frame, height, width). Splitting the token
+        # axis is a view, including the channel-major patch-embedding layout.
+        # Do not expand/reshape the modulation itself: that would materialize
+        # the same per-frame vector once for every spatial token.
+        framed = x.unflatten(1, (-1, conditioning_tokens_per_frame))
+        return modulate(framed, shift, scale).flatten(1, 2)
     if scale.dim() == 2:
         scale = scale.unsqueeze(1)
         if shift is not None:
@@ -144,6 +154,15 @@ def modulate(x: Tensor, shift: Optional[Tensor], scale: Tensor) -> Tensor:
     if shift is None:
         return x * (1 + scale)
     return x * (1 + scale) + shift
+
+
+def _apply_gate(
+    update: Tensor, gate: Tensor, conditioning_tokens_per_frame: Optional[int],
+) -> Tensor:
+    """Keep frame gates compact while preserving the original multiply/add order."""
+    if conditioning_tokens_per_frame is None:
+        return gate * update
+    return (gate * update.unflatten(1, (-1, conditioning_tokens_per_frame))).flatten(1, 2)
 
 
 class RMSNorm(nn.Module):
@@ -538,13 +557,27 @@ class BlockModulation(nn.Module):
             self.full = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, out, bias=True))
         # fully_shared: no parameters
 
-    def forward(self, emb: Tensor, shared_mod: Optional[Tensor], pose_mod: Optional[Tensor]) -> Tensor:
+    def forward(
+        self, emb: Tensor, shared_mod: Optional[Tensor], pose_mod: Optional[Tensor],
+        conditioning_tokens_per_frame: Optional[int] = None,
+    ) -> Tensor:
         if self.adaln_mode == "adaln_lora":
             mod = shared_mod + self.lora(emb)
         elif self.adaln_mode == "fully_shared":
             mod = shared_mod
         else:  # per_block
             mod = self.full(emb)
+        if conditioning_tokens_per_frame is not None:
+            # Project only B*T rows. Keep the singleton spatial axis until an
+            # elementwise operation consumes it; no dense modulation gather.
+            mod = mod.unsqueeze(2)
+            if pose_mod is not None:
+                # In per_block/action mode this channel carries a frame delta;
+                # actual ray-encoded pose deltas remain spatially varying.
+                if pose_mod.shape[1] == emb.shape[1]:
+                    pose_mod = pose_mod.unsqueeze(2)
+                else:
+                    pose_mod = pose_mod.unflatten(1, (-1, conditioning_tokens_per_frame))
         if pose_mod is not None:
             mod = mod + pose_mod
         return mod
@@ -582,12 +615,13 @@ class MiniWorldBlock(nn.Module):
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
         cached_chunk_tokens: Optional[int] = None,
+        conditioning_tokens_per_frame: Optional[int] = None,
     ):
-        mod = self.modulation(emb, shared_mod, pose_mod)
+        mod = self.modulation(emb, shared_mod, pose_mod, conditioning_tokens_per_frame)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
 
         attn_result = self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa),
+            modulate(self.norm1(x), shift_msa, scale_msa, conditioning_tokens_per_frame),
             rope=feat_rope,
             attn_mask=attn_mask,
             past_kv=past_kv,
@@ -598,8 +632,9 @@ class MiniWorldBlock(nn.Module):
             attn_out, new_kv = attn_result
         else:
             attn_out, new_kv = attn_result, None
-        x = x + gate_msa * attn_out
-        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + _apply_gate(attn_out, gate_msa, conditioning_tokens_per_frame)
+        mlp_out = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp, conditioning_tokens_per_frame))
+        x = x + _apply_gate(mlp_out, gate_mlp, conditioning_tokens_per_frame)
         if return_kv:
             return x, new_kv
         return x
@@ -612,13 +647,17 @@ class FinalLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
 
-    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, emb: Tensor, conditioning_tokens_per_frame: Optional[int] = None,
+    ) -> Tensor:
         cond = self.adaLN_modulation(emb)
+        if conditioning_tokens_per_frame is not None:
+            cond = cond.unsqueeze(2)
         if cond.dim() == 2:
             shift, scale = cond.chunk(2, dim=1)
         else:
             shift, scale = cond.chunk(2, dim=-1)
-        return self.linear(modulate(self.norm(x), shift, scale))
+        return self.linear(modulate(self.norm(x), shift, scale, conditioning_tokens_per_frame))
 
 
 # --------------------------------------------------------------------------- #
@@ -816,13 +855,18 @@ class MiniWorldModel(nn.Module):
         dtype,
         cond_drop: Optional[Tensor],
         frame_offset: int = 0,
+        framewise: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
-        """Return ``(emb_tok, shared_mod_tok, pose_mod_tok)`` all in per-token layout.
+        """Build embeddings and modulation, optionally keeping uniform terms compact.
 
         * ``emb_tok``       : ``(B, N, D)`` timestep(+action) embedding.
         * ``shared_mod_tok``: ``(B, N, 6D)`` shared AdaLN modulation, or None
           (``per_block`` mode does not use it).
         * ``pose_mod_tok``  : ``(B, N, 6D)`` pose modulation, or None.
+
+        With ``framewise=True``, embedding/shared terms keep shape (B, T, D/6D).
+        Real pose terms remain (B, N, 6D); per_block action deltas use (B, T, 6D).
+        Callers must pass the frame layout to blocks and the final layer too.
 
         ``frame_offset`` is the absolute temporal index of this window's first
         latent frame (0 for whole-clip / training / the first streaming window;
@@ -840,6 +884,8 @@ class MiniWorldModel(nn.Module):
                 raise ValueError(f"t shape {t.shape} != frames {grid_t} or tokens {n}")
         else:
             raise ValueError(f"Unsupported timestep shape: {t.shape}")
+        if framewise and per_token_t and n != grid_t:
+            raise ValueError("Framewise conditioning requires global or per-frame timesteps")
         t_emb = self.t_embedder(t)  # (B, grid_t, D) or (B, N, D)
 
         drop_mask = self._resolve_drop_mask(b, device, cond_drop)  # (B,) bool or None
@@ -864,7 +910,9 @@ class MiniWorldModel(nn.Module):
                 y = y.clone()
                 y[:, 0:1, :] = null
             a_emb, a_mod = self.action_encoder(y)  # (B,grid_t,D), (B,grid_t,6D)
-            t_emb = t_emb + a_emb
+            # Token-varying timesteps still need the corresponding frame action.
+            # The common per-frame path keeps the original addition unchanged.
+            t_emb = t_emb + (a_emb[:, frame_ids, :] if per_token_t else a_emb)
             action_mod = a_mod
         else:
             action_mod = None
@@ -875,18 +923,19 @@ class MiniWorldModel(nn.Module):
         t_emb = self.emb_norm(t_emb)
 
         # ---- broadcast per-frame -> per-token -------------------------- #
-        emb_tok = t_emb if per_token_t else t_emb[:, frame_ids, :]  # (B, N, D)
+        emb_tok = t_emb if (per_token_t or framewise) else t_emb[:, frame_ids, :]
 
         shared_mod_tok: Optional[Tensor] = None
         if self.adaln_mode in ("adaln_lora", "fully_shared"):
-            shared = self.shared_mod(emb_tok)  # (B, N, 6D)
+            shared = self.shared_mod(emb_tok)  # (B, T, 6D) or (B, N, 6D)
             if action_mod is not None:
-                shared = shared + action_mod[:, frame_ids, :]
+                shared = shared + (action_mod if framewise else action_mod[:, frame_ids, :])
             shared_mod_tok = shared
         elif action_mod is not None:
             # per_block mode has no shared term; route action modulation
             # through the pose channel (both are additive per-token deltas).
-            action_mod = action_mod[:, frame_ids, :]
+            if not framewise:
+                action_mod = action_mod[:, frame_ids, :]
 
         # ---- pose -> per-token spatial modulation ---------------------- #
         pose_mod_tok: Optional[Tensor] = None
@@ -1047,10 +1096,21 @@ class MiniWorldModel(nn.Module):
         def feat_rope_current(tt: Tensor) -> Tensor:
             return self.feat_rope(tt, num_frames_override=grid_t_cur, start_frame=int(current_position_offset))
 
+        # Eligibility is structural: never inspect timestep values on the GPU
+        # or collapse truly token-varying conditioning. Only this cached eval
+        # path opts in; ordinary forward/training retain their original layout.
+        # Recompute on each call, including CFG branches and denoising steps.
+        framewise = (
+            self.optimization_config.framewise_conditioning
+            and not self.training
+            and (t.dim() == 1 or (t.dim() == 2 and t.shape[1] == grid_t_cur))
+        )
+        conditioning_tokens_per_frame = tokens_per_frame if framewise else None
         frame_ids = torch.arange(n_cur, device=x.device, dtype=torch.long) // tokens_per_frame
         emb_tok, shared_mod_tok, pose_mod_tok = self._build_conditioning(
             t, y, b, grid_t_cur, n_cur, frame_ids, x.device, x.dtype, cond_drop,
             frame_offset=int(current_position_offset),
+            framewise=framewise,
         )
 
         new_kv_list: List[Optional[Tuple[Tensor, Tensor]]] = [None] * self.depth
@@ -1059,13 +1119,14 @@ class MiniWorldModel(nn.Module):
                 x, emb_tok, shared_mod_tok, pose_mod_tok, feat_rope_current, attn_mask,
                 past_kv_list[idx], return_kv,
                 cached_chunk_tokens=cached_chunk_tokens,
+                conditioning_tokens_per_frame=conditioning_tokens_per_frame,
             )
             if return_kv:
                 x, new_kv_list[idx] = out
             else:
                 x = out
 
-        x = self.final_layer(x, emb_tok)
+        x = self.final_layer(x, emb_tok, conditioning_tokens_per_frame)
         c_out = self.out_channels
         x_vid = x.reshape(b, grid_t_cur, grid_h, grid_w, p_t, p_h, p_w, c_out)
         x_vid = torch.einsum("nthwpqrc->nctphqwr", x_vid)

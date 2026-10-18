@@ -39,7 +39,11 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
         from_path = load_optimization_config(self.path)
         from_string = load_optimization_config(str(self.path))
         from_instance = load_optimization_config(OptimizationConfig(False))
-        expected = {"schema_version": 1, "chunkwise_flash_attention": False}
+        expected = {
+            "schema_version": 1,
+            "chunkwise_flash_attention": False,
+            "framewise_conditioning": True,
+        }
         for config in (from_path, from_string, from_instance):
             self.assertEqual(config.as_dict(), expected)
         self.assertEqual(Path(from_path.source_path).resolve(), self.path.resolve())
@@ -47,6 +51,25 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
     def test_missing_switch_preserves_existing_enabled_default(self):
         self.write_config("schema_version = 1\n")
+        self.assertIs(load_optimization_config(self.path).chunkwise_flash_attention, True)
+        self.assertIs(load_optimization_config(self.path).framewise_conditioning, True)
+
+    def test_framewise_conditioning_is_independent_and_enabled_by_default(self):
+        # File and Python defaults agree; an explicit false selects the baseline.
+        self.write_config("schema_version = 1\nchunkwise_flash_attention = true\n")
+        self.assertIs(load_optimization_config(self.path).framewise_conditioning, True)
+        self.assertIs(OptimizationConfig().framewise_conditioning, True)
+        self.write_config(
+            "schema_version = 1\n"
+            "chunkwise_flash_attention = false\n"
+            "framewise_conditioning = true\n"
+        )
+        config = load_optimization_config(self.path)
+        self.assertIs(config.chunkwise_flash_attention, False)
+        self.assertIs(config.framewise_conditioning, True)
+        self.assertIs(config.snapshot()["requested"]["framewise_conditioning"], True)
+        self.write_config("schema_version = 1\nframewise_conditioning = false\n")
+        self.assertIs(load_optimization_config(self.path).framewise_conditioning, False)
         self.assertIs(load_optimization_config(self.path).chunkwise_flash_attention, True)
 
     def test_unknown_switch_fails_instead_of_silently_ignoring_a_typo(self):
@@ -70,17 +93,19 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
     def test_strings_and_numbers_are_not_boolean_switches(self):
         # bool("false") and bool(1) would both silently turn the switch on.
-        for value in ('"false"', "0", "1", "[]"):
-            with self.subTest(value=value):
-                self.write_config(f"schema_version = 1\nchunkwise_flash_attention = {value}\n")
-                with self.assertRaises(TypeError):
-                    load_optimization_config(self.path)
+        for name in ("chunkwise_flash_attention", "framewise_conditioning"):
+            for value in ('"false"', "0", "1", "[]"):
+                with self.subTest(name=name, value=value):
+                    self.write_config(f"schema_version = 1\n{name} = {value}\n")
+                    with self.assertRaises(TypeError):
+                        load_optimization_config(self.path)
 
     def test_python_config_also_rejects_non_boolean_switches(self):
-        for value in ("false", 0, 1, None):
-            with self.subTest(value=value):
-                with self.assertRaises(TypeError):
-                    OptimizationConfig(chunkwise_flash_attention=value)
+        for name in ("chunkwise_flash_attention", "framewise_conditioning"):
+            for value in ("false", 0, 1, None):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(TypeError):
+                        OptimizationConfig(**{name: value})
 
     def test_duplicate_key_and_missing_file_fail(self):
         self.write_config(
@@ -132,7 +157,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
 class OptimizationConfigIntegrationTests(unittest.TestCase):
     def test_denoiser_config_forwards_explicit_optimization_config(self):
-        config = OptimizationConfig(chunkwise_flash_attention=False)
+        config = OptimizationConfig(chunkwise_flash_attention=False, framewise_conditioning=True)
 
         def construct(**kwargs):
             return small_model(optimization_config=kwargs["optimization_config"])
@@ -148,6 +173,7 @@ class OptimizationConfigIntegrationTests(unittest.TestCase):
             ))
         self.assertIs(factory.call_args.kwargs["optimization_config"], config)
         self.assertIs(denoiser.net.optimization_config.chunkwise_flash_attention, False)
+        self.assertIs(denoiser.net.optimization_config.framewise_conditioning, True)
 
     def test_per_call_override_rejects_ambiguous_values(self):
         model = small_model(optimization_config=OptimizationConfig(False))

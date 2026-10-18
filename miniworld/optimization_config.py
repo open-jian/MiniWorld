@@ -29,17 +29,21 @@ class OptimizationConfig:
     chunkwise_flash_attention: bool = True
     # Provenance only; it is not a supported TOML key or a checkpoint tensor.
     source_path: str | None = field(default=None, repr=False, compare=False)
+    # Disable explicitly for the reference path; GEMM shape affects BF16 rounding.
+    framewise_conditioning: bool = True
 
     def __post_init__(self) -> None:
         # bool("false") is True: never coerce strings/numbers into switches.
-        if type(self.chunkwise_flash_attention) is not bool:
-            raise TypeError("chunkwise_flash_attention must be a TOML/Python boolean")
+        for name in ("chunkwise_flash_attention", "framewise_conditioning"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be a TOML/Python boolean")
 
     def as_dict(self) -> dict:
         """Serializable requested options, separate from backend fallback."""
         return {
             "schema_version": 1,
             "chunkwise_flash_attention": self.chunkwise_flash_attention,
+            "framewise_conditioning": self.framewise_conditioning,
         }
 
     def snapshot(self) -> dict:
@@ -52,7 +56,8 @@ def load_optimization_config(
 ) -> OptimizationConfig:
     """Load the default file, a chosen TOML file, or an explicit Python config.
 
-    An absent switch uses the version-1 default (True, matching v1.0 behavior).
+    Absent switches use the current defaults (both optimizations enabled).
+    Set a switch to False explicitly when a reference execution path is needed.
     An absent/invalid *file*, version, or unknown key is an error, not a silent
     fallback. Add future switches here together with their actual call sites;
     unsupported optimizations must not appear as enabled no-op placeholders.
@@ -62,7 +67,7 @@ def load_optimization_config(
     path = (DEFAULT_OPTIMIZATION_CONFIG if source is None else Path(source)).expanduser().resolve()
     with path.open("rb") as stream:
         values = tomllib.load(stream)
-    unknown = set(values) - {"schema_version", "chunkwise_flash_attention"}
+    unknown = set(values) - {"schema_version", "chunkwise_flash_attention", "framewise_conditioning"}
     if unknown:
         raise ValueError(f"Unknown optimization config keys in {path}: {', '.join(sorted(unknown))}")
     version = values.get("schema_version")
@@ -71,4 +76,5 @@ def load_optimization_config(
     return OptimizationConfig(
         chunkwise_flash_attention=values.get("chunkwise_flash_attention", True),
         source_path=str(path),
+        framewise_conditioning=values.get("framewise_conditioning", True),
     )
