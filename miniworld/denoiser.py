@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from miniworld.kv_cache import ResidentKVCache
 from miniworld.vae.codec import print0 as _print0
 
 
@@ -605,6 +606,7 @@ class DiffusionForcingDenoiser(Denoiser):
         stream_decoder=None,
         collect_stream_timing: bool = False,
         noise: Optional[torch.Tensor] = None,
+        use_resident_kv_cache: bool = True,
         **kwargs,
     ):
         """Streaming AR-diffusion with KV cache (position-bounded, renumbered from 0).
@@ -640,7 +642,9 @@ class DiffusionForcingDenoiser(Denoiser):
                 ``history_len % df_chunk_size`` frames are pinned to ``t=0``
                 inside the first in-flight chunk.
             max_cache_chunks: max number of committed chunks retained in the
-                cache at any one time.
+                cache at any one time, INCLUDING sink (legacy parameter
+                semantics). The sliding history alone excludes both sink and
+                in-flight chunks; resident storage does not change this limit.
             inflight_chunks: number of chunks simultaneously being denoised.
             sink_frames: StreamingLLM-style attention-sink size in frames. 0
                 (default) = pure sliding window (no resident anchor). >0 pins the
@@ -655,6 +659,9 @@ class DiffusionForcingDenoiser(Denoiser):
             noise: optional ``(B, C, >=total_len, H, W)`` initial noise; pass a
                 fixed tensor to make repeated rollouts comparable. Sampled from
                 the global RNG when omitted.
+            use_resident_kv_cache: reuse per-layer KV storage across denoising
+                steps. False keeps the original list/cat implementation for
+                comparison or rollback, with identical sampling settings.
         """
         del kwargs
         device = latents.device
@@ -718,6 +725,18 @@ class DiffusionForcingDenoiser(Denoiser):
         cache_cond: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * depth
         cache_uncond: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * depth if use_cfg else []
         cache_frames = 0
+        # Capacity is STORAGE, not a larger attention window. Scratch starts at
+        # the current valid length and is excluded from committed history. Also
+        # allow one whole t=0 commit BEFORE eviction and the original prefill.
+        # Banks are local to this rollout and distinct for both CFG branches;
+        # their lazy allocation inherits actual per-layer K/V dtypes/devices.
+        resident_capacity = max(
+            max_cache_frames + inflight_frames,
+            max_cache_frames + chunk_size,
+            n_full_ctx_frames,
+        ) * tokens_per_frame
+        resident_cond = ResidentKVCache(depth, resident_capacity) if use_resident_kv_cache else None
+        resident_uncond = ResidentKVCache(depth, resident_capacity) if use_resident_kv_cache and use_cfg else None
 
         # --- Output buffer ---
         if noise is None:
@@ -792,16 +811,26 @@ class DiffusionForcingDenoiser(Denoiser):
                     ctx_frames, ctx_t, ctx_cond,
                     past_kv_list=None, current_position_offset=0,
                     return_kv=True, chunk_size=chunk_size,
+                    resident_cache=resident_cond,
                 )
-                cache_cond = list(kv_cond_ctx)
+                if resident_cond is None:
+                    cache_cond = list(kv_cond_ctx)
                 if use_cfg:
                     ctx_uncond, ctx_drop_uncond = self._make_uncond(ctx_cond)
                     _, kv_uncond_ctx = net.forward_with_cache(
                         ctx_frames, ctx_t, ctx_uncond,
                         past_kv_list=None, current_position_offset=0,
                         return_kv=True, chunk_size=chunk_size, cond_drop=ctx_drop_uncond,
+                        resident_cache=resident_uncond,
                     )
-                    cache_uncond = list(kv_uncond_ctx)
+                    if resident_uncond is None:
+                        cache_uncond = list(kv_uncond_ctx)
+                    del kv_uncond_ctx
+                if resident_cond is not None:
+                    resident_cond.commit()
+                    if resident_uncond is not None:
+                        resident_uncond.commit()
+                del kv_cond_ctx
                 cache_frames = n_full_ctx_frames
                 # Decode clean context immediately (same order as batch decode).
                 _stream_decode_upto(n_full_ctx_frames)
@@ -843,6 +872,7 @@ class DiffusionForcingDenoiser(Denoiser):
             )
             self.last_eval_meta["cfg_enabled"] = bool(use_cfg)
             self.last_eval_meta["stream_timing_enabled"] = bool(timing_enabled)
+            self.last_eval_meta["resident_kv_cache"] = bool(use_resident_kv_cache)
             _print0(f"[StreamingGen] total_len={total_len}, total_chunks={total_chunks}, "
                     f"ctx_chunks={n_full_ctx_chunks}, chunk_size={chunk_size}, "
                     f"inflight_chunks={inflight_chunks}, max_cache_chunks={max_cache_chunks}, "
@@ -906,20 +936,33 @@ class DiffusionForcingDenoiser(Denoiser):
 
                     _, kv_cond_new = net.forward_with_cache(
                         commit_frames, t_commit, commit_cond,
-                        past_kv_list=cache_cond,
+                        past_kv_list=cache_cond if resident_cond is None else None,
                         current_position_offset=cache_frames,
                         return_kv=True, chunk_size=chunk_size,
+                        resident_cache=resident_cond,
                     )
-                    cache_cond = self._append_kv_cache(cache_cond, kv_cond_new)
+                    if resident_cond is None:
+                        cache_cond = self._append_kv_cache(cache_cond, kv_cond_new)
+                    del kv_cond_new
                     if use_cfg:
                         commit_uncond, commit_drop_uncond = self._make_uncond(commit_cond)
                         _, kv_uncond_new = net.forward_with_cache(
                             commit_frames, t_commit, commit_uncond,
-                            past_kv_list=cache_uncond,
+                            past_kv_list=cache_uncond if resident_uncond is None else None,
                             current_position_offset=cache_frames,
                             return_kv=True, chunk_size=chunk_size, cond_drop=commit_drop_uncond,
+                            resident_cache=resident_uncond,
                         )
-                        cache_uncond = self._append_kv_cache(cache_uncond, kv_uncond_new)
+                        if resident_uncond is None:
+                            cache_uncond = self._append_kv_cache(cache_uncond, kv_uncond_new)
+                        del kv_uncond_new
+                    # Keep BOTH branches at the old position until their clean
+                    # t=0 forwards finish. Promoting noisy scratch or evicting
+                    # before this forward would change the generated history.
+                    if resident_cond is not None:
+                        resident_cond.commit()
+                        if resident_uncond is not None:
+                            resident_uncond.commit()
                     cache_frames += commit_frames.shape[2]
 
                     if cache_frames > max_cache_frames:
@@ -927,15 +970,26 @@ class DiffusionForcingDenoiser(Denoiser):
                         drop = min(cache_frames - max_cache_frames,
                                    cache_frames - sink_frames)
                         if drop > 0:
-                            cache_cond = self._evict_and_shift_cache(
-                                cache_cond, drop, tokens_per_frame, rope_module,
-                                sink_frames=sink_frames,
-                            )
-                            if use_cfg:
-                                cache_uncond = self._evict_and_shift_cache(
-                                    cache_uncond, drop, tokens_per_frame, rope_module,
+                            if resident_cond is not None:
+                                resident_cond.evict_and_shift(
+                                    drop, tokens_per_frame, rope_module,
                                     sink_frames=sink_frames,
                                 )
+                                if resident_uncond is not None:
+                                    resident_uncond.evict_and_shift(
+                                        drop, tokens_per_frame, rope_module,
+                                        sink_frames=sink_frames,
+                                    )
+                            else:
+                                cache_cond = self._evict_and_shift_cache(
+                                    cache_cond, drop, tokens_per_frame, rope_module,
+                                    sink_frames=sink_frames,
+                                )
+                                if use_cfg:
+                                    cache_uncond = self._evict_and_shift_cache(
+                                        cache_uncond, drop, tokens_per_frame, rope_module,
+                                        sink_frames=sink_frames,
+                                    )
                             cache_frames -= drop
 
                     committed_chunks.add(ci)
@@ -979,17 +1033,19 @@ class DiffusionForcingDenoiser(Denoiser):
 
                 v_cond_pred, _ = net.forward_with_cache(
                     inflight_z, t_frame, inflight_cond,
-                    past_kv_list=cache_cond,
+                    past_kv_list=cache_cond if resident_cond is None else None,
                     current_position_offset=cache_frames,
                     return_kv=False, chunk_size=chunk_size,
+                    resident_cache=resident_cond,
                 )
                 if use_cfg:
                     inflight_uncond, inflight_drop_uncond = self._make_uncond(inflight_cond)
                     v_uncond_pred, _ = net.forward_with_cache(
                         inflight_z, t_frame, inflight_uncond,
-                        past_kv_list=cache_uncond,
+                        past_kv_list=cache_uncond if resident_uncond is None else None,
                         current_position_offset=cache_frames,
                         return_kv=False, chunk_size=chunk_size, cond_drop=inflight_drop_uncond,
+                        resident_cache=resident_uncond,
                     )
                 else:
                     v_uncond_pred = None

@@ -40,6 +40,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from flash_attn import flash_attn_func
+from miniworld.kv_cache import ResidentKVCache
 
 # FlexAttention is optional; disabled by default
 create_block_mask = None
@@ -240,6 +241,8 @@ class Attention(nn.Module):
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
         cached_chunk_tokens: Optional[int] = None,
+        resident_cache: Optional[ResidentKVCache] = None,
+        cache_layer: int = 0,
     ):
         B, N, C = x.shape
         in_dtype = x.dtype
@@ -252,7 +255,11 @@ class Attention(nn.Module):
             k = rope(k)
 
         k_current, v_current = k, v
-        if past_kv is not None:
+        if resident_cache is not None:
+            if past_kv is not None:
+                raise ValueError("resident_cache and past_kv are mutually exclusive")
+            k, v = resident_cache.write_layer(cache_layer, k, v)
+        elif past_kv is not None:
             k_past, v_past = past_kv
             k = torch.cat([k_past.to(dtype=k.dtype, device=k.device), k], dim=-2)
             v = torch.cat([v_past.to(dtype=v.dtype, device=v.device), v], dim=-2)
@@ -260,10 +267,13 @@ class Attention(nn.Module):
         if cached_chunk_tokens is not None:
             if attn_mask is not None:
                 raise ValueError("cached_chunk_tokens cannot be combined with an arbitrary attention mask")
-            # Projection, QK norm, RoPE and KV concatenation remain shared by
-            # both backends; only the block-causal attention evaluation changes.
+            # Both storage paths use identical projection / QK norm / RoPE.
+            # Resident prefixes have capacity-based strides; FlashAttention
+            # accepts them as long as the last dimension is contiguous. The
+            # existing FP32 K -> attention-dtype conversion still happens in
+            # the helper; resident storage does not eliminate that conversion.
             x = _chunkwise_flash_attention(q, k, v, cached_chunk_tokens)
-        elif attn_mask is None and past_kv is None:
+        elif attn_mask is None and past_kv is None and resident_cache is None:
             # flash-attn fast path expects (B, N, num_heads, head_dim)
             q = q.transpose(1, 2).to(torch.bfloat16)
             k = k.transpose(1, 2).to(torch.bfloat16)
@@ -275,6 +285,8 @@ class Attention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C).to(in_dtype)
         x = self.proj_drop(self.proj(x))
         if return_kv:
+            # Keep legacy ownership: return freshly projected current tensors,
+            # NOT borrowed arena views that a later denoising step overwrites.
             return x, (k_current, v_current)
         return x
 
@@ -579,6 +591,8 @@ class MiniWorldBlock(nn.Module):
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
         cached_chunk_tokens: Optional[int] = None,
+        resident_cache: Optional[ResidentKVCache] = None,
+        cache_layer: int = 0,
     ):
         mod = self.modulation(emb, shared_mod, pose_mod)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
@@ -590,6 +604,8 @@ class MiniWorldBlock(nn.Module):
             past_kv=past_kv,
             return_kv=return_kv,
             cached_chunk_tokens=cached_chunk_tokens,
+            resident_cache=resident_cache,
+            cache_layer=cache_layer,
         )
         if return_kv:
             attn_out, new_kv = attn_result
@@ -973,13 +989,23 @@ class MiniWorldModel(nn.Module):
         chunk_size: int = 1,
         cond_drop: Optional[Tensor] = None,
         use_chunk_flash_attn: bool = True,
+        resident_cache: Optional[ResidentKVCache] = None,
     ):
         """Streaming forward with optional KV cache injection (RoPE-only).
 
         Chunk FlashAttention replaces only the cached block-causal attention
         kernel. Set ``use_chunk_flash_attn=False`` for the original masked SDPA
         reference. Cache capacity, sink, chunk boundaries and RoPE are unchanged.
+
+        ``resident_cache`` replaces list concatenation with caller-owned mutable
+        storage and cannot be combined with ``past_kv_list``. Every call stages
+        current KV; only a successful ``return_kv=True`` call permits a later
+        explicit ``resident_cache.commit()``. The caller must commit clean t=0
+        KV, after both CFG branches have run at the old position. Returned KV
+        keeps the original independent lifetime even when using resident storage.
         """
+        if resident_cache is not None:
+            resident_cache.discard_pending()
         b, c_in, t_cur, h_in, w_in = x.shape
         x = self.x_embedder(x)
 
@@ -994,13 +1020,22 @@ class MiniWorldModel(nn.Module):
         n_cur = grid_t_cur * tokens_per_frame
         assert x.shape[1] == n_cur, f"patch embed produced {x.shape[1]} tokens, expected {n_cur}"
 
+        if resident_cache is not None and past_kv_list is not None:
+            raise ValueError("resident_cache and past_kv_list are mutually exclusive")
         if past_kv_list is None:
             past_kv_list = [None] * self.depth
         assert len(past_kv_list) == self.depth
 
         n_past = 0
         first_past = next((kv for kv in past_kv_list if kv is not None), None)
-        if first_past is not None:
+        if resident_cache is not None:
+            if resident_cache.depth != self.depth:
+                raise ValueError("resident cache depth does not match model")
+            n_past = resident_cache.length
+            if n_past != current_position_offset * tokens_per_frame:
+                raise ValueError("resident cache length does not match RoPE position offset")
+            resident_cache.begin_forward(n_cur, allow_commit=return_kv)
+        elif first_past is not None:
             n_past = int(first_past[0].shape[-2])
             assert n_past == current_position_offset * tokens_per_frame, (
                 f"past token len {n_past} != offset*tokens_per_frame "
@@ -1045,6 +1080,8 @@ class MiniWorldModel(nn.Module):
                 x, emb_tok, shared_mod_tok, pose_mod_tok, feat_rope_current, attn_mask,
                 past_kv_list[idx], return_kv,
                 cached_chunk_tokens=cached_chunk_tokens,
+                resident_cache=resident_cache,
+                cache_layer=idx,
             )
             if return_kv:
                 x, new_kv_list[idx] = out
@@ -1057,6 +1094,10 @@ class MiniWorldModel(nn.Module):
         x_vid = torch.einsum("nthwpqrc->nctphqwr", x_vid)
         v_pred = x_vid.reshape(b, c_out, grid_t_cur * p_t, grid_h * p_h, grid_w * p_w)
 
+        if resident_cache is not None:
+            # A partial/failed forward must never become committable, including
+            # failures after the final attention layer (e.g. output projection).
+            resident_cache.finish_forward()
         if return_kv:
             return v_pred, new_kv_list
         return v_pred, None
