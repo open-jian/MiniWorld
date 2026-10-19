@@ -48,6 +48,7 @@ from miniworld.fused_norm_modulation import can_fuse_norm_modulation, fused_norm
 from miniworld.fused_residual_gate_add import can_fuse_residual_gate_add, fused_residual_gate_add
 from miniworld.fused_rope import can_fuse_rope, fused_rope
 from miniworld.fused_bias_swiglu import can_fuse_bias_swiglu_input, fused_bias_swiglu
+from miniworld.fused_k_concat_cast import can_fuse_k_concat_cast, fused_k_concat_cast
 
 # FlexAttention is optional; disabled by default
 create_block_mask = None
@@ -359,6 +360,7 @@ class Attention(nn.Module):
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
         cached_chunk_tokens: Optional[int] = None,
+        use_fused_k_concat_cast: bool = False,
     ):
         B, N, C = x.shape
         in_dtype = x.dtype
@@ -370,17 +372,30 @@ class Attention(nn.Module):
             q = rope(q)
             k = rope(k)
 
+        # Capture canonical K/V BEFORE assembling attention-only buffers. In
+        # particular, cache commits and RoPE rebasing must retain the FP32 K.
         k_current, v_current = k, v
         if past_kv is not None:
             k_past, v_past = past_kv
-            k = torch.cat([k_past.to(dtype=k.dtype, device=k.device), k], dim=-2)
+            if (use_fused_k_concat_cast and cached_chunk_tokens is not None
+                    and attn_mask is None and not self.training
+                    and not torch.is_grad_enabled()
+                    and torch.is_autocast_enabled("cuda")
+                    and torch.get_autocast_dtype("cuda") == torch.bfloat16
+                    and k_past.shape[-2] > 0 and can_fuse_k_concat_cast(k_past, k)):
+                # Preserve the old cat+cast physical layout and BF16 rounding,
+                # but never materialize the intermediate full FP32 K. All
+                # historical K is still read; this is not a persistent BF16 cache.
+                k = fused_k_concat_cast(k_past, k)
+            else:
+                k = torch.cat([k_past.to(dtype=k.dtype, device=k.device), k], dim=-2)
             v = torch.cat([v_past.to(dtype=v.dtype, device=v.device), v], dim=-2)
 
         if cached_chunk_tokens is not None:
             if attn_mask is not None:
                 raise ValueError("cached_chunk_tokens cannot be combined with an arbitrary attention mask")
-            # Projection, QK norm, RoPE and KV concatenation remain shared by
-            # both backends; only the block-causal attention evaluation changes.
+            # The helper's K cast is a no-op if fusion already assembled BF16 K.
+            # Its layout and block-causal visibility are unchanged.
             x = _chunkwise_flash_attention(q, k, v, cached_chunk_tokens)
         elif attn_mask is None and past_kv is None:
             # flash-attn fast path expects (B, N, num_heads, head_dim)
@@ -396,6 +411,9 @@ class Attention(nn.Module):
         if return_kv:
             return x, (k_current, v_current)
         return x
+
+
+_BUILTIN_ATTENTION_FORWARD = Attention.forward
 
 
 # --------------------------------------------------------------------------- #
@@ -730,10 +748,20 @@ class MiniWorldBlock(nn.Module):
         use_fused_norm_modulation: bool = False,
         use_fused_residual_gate_add: bool = False,
         use_fused_bias_swiglu: bool = False,
+        use_fused_k_concat_cast: bool = False,
     ):
         mod = self.modulation(emb, shared_mod, pose_mod, conditioning_tokens_per_frame)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
 
+        # Do not send a new keyword to custom Attention forwards or hooks that
+        # observe call arguments. Those extensions retain their existing path.
+        attention_options = {}
+        if (use_fused_k_concat_cast and not self.training
+                and type(self.attn) is Attention
+                and type(self.attn).forward is _BUILTIN_ATTENTION_FORWARD
+                and "forward" not in self.attn.__dict__
+                and not _has_forward_observers(self.attn)):
+            attention_options["use_fused_k_concat_cast"] = True
         attn_result = self.attn(
             _norm_modulate(
                 self.norm1, x, shift_msa, scale_msa,
@@ -744,6 +772,7 @@ class MiniWorldBlock(nn.Module):
             past_kv=past_kv,
             return_kv=return_kv,
             cached_chunk_tokens=cached_chunk_tokens,
+            **attention_options,
         )
         if return_kv:
             attn_out, new_kv = attn_result
@@ -766,6 +795,9 @@ class MiniWorldBlock(nn.Module):
         if return_kv:
             return x, new_kv
         return x
+
+
+_BUILTIN_BLOCK_FORWARD = MiniWorldBlock.forward
 
 
 class FinalLayer(nn.Module):
@@ -1285,6 +1317,12 @@ class MiniWorldModel(nn.Module):
         # Only cached eval opts in. The FFN checks the actual Linear input layout
         # before omitting its bias, so unsupported calls retain the original GEMM.
         use_fused_bias_swiglu = self.optimization_config.fused_bias_swiglu and not self.training
+        # K fusion is meaningful only for the selected chunkwise FA backend;
+        # SDPA and ordinary/training forward keep their original K assembly.
+        use_fused_k_concat_cast = (
+            self.optimization_config.fused_k_concat_cast
+            and cached_chunk_tokens is not None and not self.training
+        )
         frame_ids = torch.arange(n_cur, device=x.device, dtype=torch.long) // tokens_per_frame
         emb_tok, shared_mod_tok, pose_mod_tok = self._build_conditioning(
             t, y, b, grid_t_cur, n_cur, frame_ids, x.device, x.dtype, cond_drop,
@@ -1294,6 +1332,14 @@ class MiniWorldModel(nn.Module):
 
         new_kv_list: List[Optional[Tuple[Tensor, Tensor]]] = [None] * self.depth
         for idx, block in enumerate(self.blocks):
+            # Preserve existing signatures and observer-visible kwargs on
+            # custom blocks. The built-in block guards its Attention similarly.
+            block_options = {}
+            if (use_fused_k_concat_cast and type(block) is MiniWorldBlock
+                    and type(block).forward is _BUILTIN_BLOCK_FORWARD
+                    and "forward" not in block.__dict__
+                    and not _has_forward_observers(block)):
+                block_options["use_fused_k_concat_cast"] = True
             out = block(
                 x, emb_tok, shared_mod_tok, pose_mod_tok, feat_rope_current, attn_mask,
                 past_kv_list[idx], return_kv,
@@ -1302,6 +1348,7 @@ class MiniWorldModel(nn.Module):
                 use_fused_norm_modulation=use_fused_norm_modulation,
                 use_fused_residual_gate_add=use_fused_residual_gate_add,
                 use_fused_bias_swiglu=use_fused_bias_swiglu,
+                **block_options,
             )
             if return_kv:
                 x, new_kv_list[idx] = out

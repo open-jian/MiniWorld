@@ -55,3 +55,14 @@ fused_rope = true
 # No weights, checkpoint keys, sampler settings, or persistent caches are changed.
 # Set false to compare against the accepted baseline with the other switches on.
 fused_bias_swiglu = true
+
+# Fuse temporary FP32 K concatenation and its BF16 attention-input conversion.
+# Read history/current K once and write the final contiguous BHND BF16 tensor;
+# canonical K returned to the cache stays FP32 for commits and RoPE rebasing.
+# This still reads all visible history per call; it creates no persistent copy.
+# Only validated B=1, heads=12, head_dim=128 cached Chunkwise FlashAttention
+# with CUDA BF16 autocast and gradients disabled is eligible. Empty history,
+# training, custom forwards/hooks, and unsupported inputs keep the original path.
+# V, cache capacity, sink, sampling and other optimization switches are unchanged.
+# Set false for the accepted seven-optimization baseline.
+fused_k_concat_cast = true

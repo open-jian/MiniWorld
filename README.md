@@ -208,6 +208,9 @@ framewise_conditioning = true
 fused_norm_modulation = true
 reuse_rope_frequencies = true
 fused_residual_gate_add = true
+fused_rope = true
+fused_bias_swiglu = true
+fused_k_concat_cast = true
 ```
 
 Set `chunkwise_flash_attention` to `false` to use the original masked SDPA in `forward_with_cache`.
@@ -262,6 +265,17 @@ eval calls with gradients disabled. Ordinary forward, training, unsupported
 inputs, and installations without Triton keep the original operations.
 Set it to `false` to disable only this optimization; all other switches remain
 independent. It does not change checkpoint keys, sink, history windows or sampling.
+
+`fused_k_concat_cast = true` directly assembles the temporary BF16 attention K
+from FP32 history/current K in one Triton kernel, avoiding an intermediate FP32
+concatenation and its reread. It preserves the original output layout and BF16
+conversion. Canonical cached/returned K stays FP32 for commits and RoPE rebasing;
+all visible history is still read per call, with no persistent BF16 copy.
+Only validated batch-one, 12-head, head-dimension-128 cached Chunkwise
+FlashAttention under CUDA BF16 autocast is eligible. Training, enabled gradients,
+custom blocks/attention forwards or hooks, unsupported inputs, and missing Triton
+retain the original path. Set it to `false` to compare with the existing seven
+optimizations unchanged. It does not change V, sink, window size or sampling.
 
 Select another file with `python -m miniworld.sample --optimization_config
 /path/to/experiment.toml` plus the usual sampling arguments, or set

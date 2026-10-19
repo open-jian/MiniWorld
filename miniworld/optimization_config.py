@@ -41,13 +41,15 @@ class OptimizationConfig:
     fused_rope: bool = True
     # Fuse the separate W12 bias add, SiLU, and product with BF16 boundaries intact.
     fused_bias_swiglu: bool = True
+    # Assemble attention-only BF16 K directly; canonical cached K stays FP32.
+    fused_k_concat_cast: bool = True
 
     def __post_init__(self) -> None:
         # bool("false") is True: never coerce strings/numbers into switches.
         for name in (
             "chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation",
             "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope",
-            "fused_bias_swiglu",
+            "fused_bias_swiglu", "fused_k_concat_cast",
         ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a TOML/Python boolean")
@@ -63,6 +65,7 @@ class OptimizationConfig:
             "fused_residual_gate_add": self.fused_residual_gate_add,
             "fused_rope": self.fused_rope,
             "fused_bias_swiglu": self.fused_bias_swiglu,
+            "fused_k_concat_cast": self.fused_k_concat_cast,
         }
 
     def snapshot(self) -> dict:
@@ -89,7 +92,7 @@ def load_optimization_config(
     unknown = set(values) - {
         "schema_version", "chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation",
         "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope",
-        "fused_bias_swiglu",
+        "fused_bias_swiglu", "fused_k_concat_cast",
     }
     if unknown:
         raise ValueError(f"Unknown optimization config keys in {path}: {', '.join(sorted(unknown))}")
@@ -105,4 +108,5 @@ def load_optimization_config(
         fused_residual_gate_add=values.get("fused_residual_gate_add", True),
         fused_rope=values.get("fused_rope", True),
         fused_bias_swiglu=values.get("fused_bias_swiglu", True),
+        fused_k_concat_cast=values.get("fused_k_concat_cast", True),
     )

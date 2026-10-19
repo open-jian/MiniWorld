@@ -205,6 +205,9 @@ framewise_conditioning = true
 fused_norm_modulation = true
 reuse_rope_frequencies = true
 fused_residual_gate_add = true
+fused_rope = true
+fused_bias_swiglu = true
+fused_k_concat_cast = true
 ```
 
 将 `chunkwise_flash_attention` 改为 `false` 后，流式 `forward_with_cache` 使用原来的带 mask SDPA。
@@ -242,6 +245,15 @@ Q/K norm、条件编码 norm 和残差相加保持独立。显式设为 `false` 
 不增加长期缓存。仅作用于关闭梯度、受支持的 CUDA BF16 cached eval；普通前向、训练、
 不支持的输入或未安装 Triton 时保留原操作。设为 `false` 只关闭这一项，其他开关独立，
 checkpoint 字段、sink、历史窗口和采样设置不变。
+
+`fused_k_concat_cast = true` 用一个 Triton kernel 直接将历史和当前 FP32 K
+拼成临时的 BF16 attention 输入，省去中间 FP32 拼接张量的写入和再次读取，
+保留原来的布局与 BF16 转换。提交到缓存及用于 RoPE 重定位的 K 仍是 FP32；
+每次调用仍读取全部可见历史，不新增长期 BF16 副本。
+仅支持已验证的 batch=1、12 个 head、head_dim=128，且采用 CUDA BF16 autocast
+的 cached Chunkwise FlashAttention。训练、启用梯度、自定义 block/attention
+前向或 hooks、不支持的输入和缺少 Triton 时保留原路径。设为 `false` 可在其余七项
+优化不变的情况下单独对照；V、sink、窗口大小和采样参数均不变。
 
 直接运行采样入口时可加 `--optimization_config /path/to/experiment.toml`；
 上述 DROID、RE10K 采样脚本和吞吐脚本支持 `OPTIMIZATION_CONFIG=/path/to/experiment.toml`。

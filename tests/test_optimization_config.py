@@ -48,6 +48,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
             "fused_residual_gate_add": True,
             "fused_rope": True,
             "fused_bias_swiglu": True,
+            "fused_k_concat_cast": True,
         }
         for config in (from_path, from_string, from_instance):
             self.assertEqual(config.as_dict(), expected)
@@ -63,6 +64,25 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
         self.assertIs(load_optimization_config(self.path).fused_residual_gate_add, True)
         self.assertIs(load_optimization_config(self.path).fused_rope, True)
         self.assertIs(load_optimization_config(self.path).fused_bias_swiglu, True)
+        self.assertIs(load_optimization_config(self.path).fused_k_concat_cast, True)
+
+    def test_fused_k_concat_cast_is_independent_and_serialized(self):
+        self.assertIs(OptimizationConfig().fused_k_concat_cast, True)
+        self.write_config("schema_version = 1\nfused_k_concat_cast = false\n")
+        config = load_optimization_config(self.path)
+        self.assertIs(config.fused_k_concat_cast, False)
+        self.assertIs(config.snapshot()["requested"]["fused_k_concat_cast"], False)
+        previous = ("chunkwise_flash_attention", "framewise_conditioning",
+                    "fused_norm_modulation", "reuse_rope_frequencies",
+                    "fused_residual_gate_add", "fused_rope", "fused_bias_swiglu")
+        for name in previous:
+            self.assertIs(getattr(config, name), True)
+        self.write_config("schema_version = 1\nfused_k_concat_cast = true\n" +
+                          "".join(f"{name} = false\n" for name in previous))
+        config = load_optimization_config(self.path)
+        self.assertIs(config.fused_k_concat_cast, True)
+        for name in previous:
+            self.assertIs(getattr(config, name), False)
 
     def test_fused_bias_swiglu_is_independent_and_serialized(self):
         self.assertIs(OptimizationConfig().fused_bias_swiglu, True)
@@ -198,7 +218,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
 
     def test_strings_and_numbers_are_not_boolean_switches(self):
         # bool("false") and bool(1) would both silently turn the switch on.
-        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope", "fused_bias_swiglu"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope", "fused_bias_swiglu", "fused_k_concat_cast"):
             for value in ('"false"', "0", "1", "[]"):
                 with self.subTest(name=name, value=value):
                     self.write_config(f"schema_version = 1\n{name} = {value}\n")
@@ -206,7 +226,7 @@ class OptimizationConfigLoadingTests(unittest.TestCase):
                         load_optimization_config(self.path)
 
     def test_python_config_also_rejects_non_boolean_switches(self):
-        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope", "fused_bias_swiglu"):
+        for name in ("chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation", "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope", "fused_bias_swiglu", "fused_k_concat_cast"):
             for value in ("false", 0, 1, None):
                 with self.subTest(name=name, value=value):
                     with self.assertRaises(TypeError):
