@@ -101,6 +101,9 @@ def build_denoiser(args: argparse.Namespace):
     cfg_kwargs.update(
         latent_size=(args.resize_h // args.spatial_downsample, args.resize_w // args.spatial_downsample),
     )
+    if getattr(args, 'kv_acceleration', 'off') == 'forcing-kv':
+        from miniworld.forcing_kv import checkpoint_identity
+        cfg_kwargs['forcing_kv_model_identity'] = checkpoint_identity(args.checkpoint)
     cfg = DenoiserConfig(**cfg_kwargs)
     return build_denoiser_from_mode(cfg)
 
@@ -313,6 +316,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream_inflight_chunks", type=int, default=8)
     parser.add_argument("--stream_max_cache_chunks", type=int, default=24)
     parser.add_argument("--stream_sink_size", type=int, default=1)
+    parser.add_argument("--headcast", action="store_true",
+                        help="Enable experimental one-time head classification and grouped history attention (default: off).")
+    parser.add_argument("--headcast_tile_height", type=int, default=5)
+    parser.add_argument("--headcast_tile_width", type=int, default=5)
+    parser.add_argument("--headcast_recent_chunks", type=int, default=2)
+    parser.add_argument("--headcast_max_relative_rmse", type=float, default=0.10)
+    parser.add_argument("--headcast_min_cosine", type=float, default=0.95)
+    parser.add_argument("--headcast_query_samples_per_chunk", type=int, default=32)
+    parser.add_argument("--kv_acceleration", choices=("off", "dense", "headcast", "headcast-source", "dummy", "combined", "forcing-kv"),
+                        default="off", help="Opt-in compact KV backend and sparse current/history attention.")
+    parser.add_argument("--kv_calibration_frames", type=int, default=8)
+    parser.add_argument("--kv_max_relative_rmse", type=float, default=0.10)
+    parser.add_argument("--kv_min_cosine", type=float, default=0.95)
+    parser.add_argument("--kv_spatial_score_threshold", type=float, default=0.755)
+    parser.add_argument("--kv_query_samples_per_chunk", type=int, default=32)
+    parser.add_argument("--kv_dummy_frames", type=int, default=1)
+    parser.add_argument("--kv_recent_frames", type=int, default=4)
+    parser.add_argument("--kv_tile_height", type=int, default=5)
+    parser.add_argument("--kv_tile_width", type=int, default=5)
+    parser.add_argument("--kv_dummy_fraction", type=float, default=0.5)
+    parser.add_argument("--forcing_kv_threshold", type=float, default=0.8)
+    parser.add_argument("--forcing_kv_segments", type=int, default=6)
+    parser.add_argument("--forcing_kv_retention", type=float, default=0.33,
+                        help="Fraction of candidate historical segments retained at each clean commit.")
+    parser.add_argument("--forcing_kv_profile", default="",
+                        help="Optional compatible MiniWorld head profile; skips online calibration.")
+    parser.add_argument("--forcing_kv_profile_output", default="",
+                        help="Export the head profile from online calibration for subsequent inference.")
     parser.add_argument("--save_fps", type=int, default=8)
     parser.add_argument("--benchmark_stream_timing", action="store_true")
     parser.add_argument("--benchmark_no_save", action="store_true")
@@ -399,6 +430,25 @@ def main() -> None:
             gen_sec = time.perf_counter() - start
             pred_latents, pred_rgb = result
 
+        if args.headcast:
+            summary = denoiser.last_eval_meta["headcast"]
+            counts = summary["group_counts"]
+            print0(
+                f"[HeadCast] sample={idx}, status={summary['status']}, "
+                f"temporal={counts['temporal']}, spatial={counts['spatial']}, "
+                f"global={counts['global']}, "
+                f"calibration_forwards={summary['calibration_forwards']}"
+            )
+
+        if args.kv_acceleration != "off":
+            summary = denoiser.last_eval_meta["kv_acceleration"]
+            print0(
+                f"[KV acceleration] sample={idx}, mode={summary['mode']}, "
+                f"status={summary['status']}, heads={summary['group_counts']}, "
+                f"compact_calls={summary['compact_attention_calls']}, "
+                f"cache_MiB={summary['final_cache_storage_bytes'] / 2**20:.1f}"
+            )
+
         if args.benchmark_stream_timing:
             row = summarize_timing(denoiser.last_eval_meta)
             row.update({"sample_idx": idx, "gen_sec": gen_sec})
@@ -419,4 +469,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -101,6 +101,37 @@ class DenoiserConfig:
         self.df_train_time_bins: int = 50
         self.df_ardiff_step: int = 1
 
+        # Opt-in, inference-only head routing. Disabled preserves the original
+        # sampler and does not instantiate/import any HeadCast runtime.
+        self.headcast: bool = False
+        self.headcast_tile_height: int = 5
+        self.headcast_tile_width: int = 5
+        self.headcast_recent_chunks: int = 2
+        self.headcast_max_relative_rmse: float = 0.10
+        self.headcast_min_cosine: float = 0.95
+        self.headcast_query_samples_per_chunk: int = 32
+
+        # Full physically compact cache path. The default takes the unchanged
+        # original sampler; runtimes are private to each enabled rollout.
+        self.kv_acceleration: str = 'off'
+        self.kv_spatial_score_threshold: float = 0.755
+        self.kv_calibration_frames: int = 8
+        self.kv_max_relative_rmse: float = 0.10
+        self.kv_min_cosine: float = 0.95
+        self.kv_query_samples_per_chunk: int = 32
+        self.kv_dummy_frames: int = 1
+        self.kv_recent_frames: int = 4
+        self.kv_tile_height: int = 5
+        self.kv_tile_width: int = 5
+        self.kv_dummy_fraction: float = 0.5
+        # Separate Forcing-KV strategy; these options are read only in its mode.
+        self.forcing_kv_threshold: float = 0.8
+        self.forcing_kv_segments: int = 6
+        self.forcing_kv_retention: float = 0.33
+        self.forcing_kv_profile: str = ''
+        self.forcing_kv_profile_output: str = ''
+        self.forcing_kv_model_identity: str = ''
+
         for k, v in kwargs.items():
             if hasattr(self, k):
                 setattr(self, k, v)
@@ -534,6 +565,8 @@ class DiffusionForcingDenoiser(Denoiser):
             k_new, v_new = new_kv[i]
             if cache[i] is None:
                 out[i] = (k_new, v_new)
+            elif hasattr(cache[i], 'append'):
+                out[i] = cache[i].append(k_new, v_new)
             else:
                 k_old, v_old = cache[i]
                 out[i] = (
@@ -573,6 +606,9 @@ class DiffusionForcingDenoiser(Denoiser):
         out: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * depth
         for i in range(depth):
             if cache[i] is None:
+                continue
+            if hasattr(cache[i], 'evict'):
+                out[i] = cache[i].evict(drop_frames, rope_module)
                 continue
             k_old, v_old = cache[i]
             # sink slice: kept verbatim (no eviction, no RoPE shift).
@@ -715,6 +751,76 @@ class DiffusionForcingDenoiser(Denoiser):
 
         use_cfg = float(self.cfg_scale) > 1.0
         depth = net.depth
+        kv_runtime = None
+        if self.cfg.kv_acceleration == 'forcing-kv':
+            if self.cfg.headcast:
+                raise ValueError('Choose kv_acceleration or legacy headcast, not both')
+            from miniworld.forcing_kv import ForcingKVConfig, ForcingKVRuntime
+            signature = {name: getattr(self.cfg, name, None) for name in (
+                'wm_model', 'cond_dim', 'cond_per_token', 'cond_dropout_prob',
+                'action_null_first', 'adaln_mode', 'wm_use_qknorm', 'wm_mlp_ratio')}
+            signature.update(cfg_scale=float(self.cfg_scale), num_sampling_steps=int(self.steps),
+                             max_cache_frames=max_cache_frames, inflight_chunks=inflight_chunks,
+                             trained_frames=trained_num_frames,
+                             timestep_shift=float(self.timestep_shift),
+                             df_ardiff_step=int(self.df_ardiff_step),
+                             use_model_null_cfg=bool(self.use_model_null_cfg),
+                             cfg_interval_min=float(self.cfg_interval_min),
+                             cfg_interval_max=float(self.cfg_interval_max))
+            kv_runtime = ForcingKVRuntime(
+                ForcingKVConfig(calibration_frames=self.cfg.kv_calibration_frames,
+                    threshold=self.cfg.forcing_kv_threshold,
+                    query_samples_per_chunk=self.cfg.kv_query_samples_per_chunk,
+                    sink_frames=sink_frames, segments=self.cfg.forcing_kv_segments,
+                    retention=self.cfg.forcing_kv_retention,
+                    profile_path=self.cfg.forcing_kv_profile,
+                    profile_output=self.cfg.forcing_kv_profile_output,
+                    model_identity=self.cfg.forcing_kv_model_identity,
+                    profile_metadata=signature),
+                depth=depth, num_heads=net.num_heads, height=grid_h, width=grid_w,
+                chunk_size=chunk_size, max_cache_frames=max_cache_frames,
+                branches=('cond', 'uncond') if use_cfg else ('cond',))
+        elif self.cfg.kv_acceleration != 'off':
+            if self.cfg.headcast:
+                raise ValueError('Choose kv_acceleration or legacy headcast, not both')
+            from miniworld.kv_acceleration import KVAccelerationConfig, KVAccelerationRuntime
+            kv_runtime = KVAccelerationRuntime(
+                KVAccelerationConfig(
+                    mode=self.cfg.kv_acceleration,
+                    calibration_frames=self.cfg.kv_calibration_frames,
+                    max_relative_rmse=self.cfg.kv_max_relative_rmse,
+                    min_cosine=self.cfg.kv_min_cosine,
+                    spatial_score_threshold=self.cfg.kv_spatial_score_threshold,
+                    query_samples_per_chunk=self.cfg.kv_query_samples_per_chunk,
+                    sink_frames=sink_frames,
+                    dummy_frames=self.cfg.kv_dummy_frames,
+                    local_frames=self.cfg.kv_recent_frames,
+                    tile_height=self.cfg.kv_tile_height,
+                    tile_width=self.cfg.kv_tile_width,
+                    dummy_fraction=self.cfg.kv_dummy_fraction,
+                ), depth=depth, num_heads=net.blocks[0].attn.num_heads,
+                height=grid_h, width=grid_w, chunk_size=chunk_size,
+                max_cache_frames=max_cache_frames,
+                branches=('cond', 'uncond') if use_cfg else ('cond',),
+            )
+        headcast = None
+        if self.cfg.headcast:
+            from miniworld.headcast import HeadCastConfig, HeadCastRuntime
+            headcast = HeadCastRuntime(
+                HeadCastConfig(
+                    enabled=True,
+                    tile_height=self.cfg.headcast_tile_height,
+                    tile_width=self.cfg.headcast_tile_width,
+                    recent_chunks=self.cfg.headcast_recent_chunks,
+                    max_relative_rmse=self.cfg.headcast_max_relative_rmse,
+                    min_cosine=self.cfg.headcast_min_cosine,
+                    query_samples_per_chunk=self.cfg.headcast_query_samples_per_chunk,
+                ),
+                depth=depth, num_heads=net.blocks[0].attn.num_heads,
+                grid_height=grid_h, grid_width=grid_w, chunk_size=chunk_size,
+                sink_frames=sink_frames, max_cache_frames=max_cache_frames,
+                branches=('cond', 'uncond') if use_cfg else ('cond',),
+            )
         cache_cond: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * depth
         cache_uncond: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * depth if use_cfg else []
         cache_frames = 0
@@ -909,6 +1015,8 @@ class DiffusionForcingDenoiser(Denoiser):
                         past_kv_list=cache_cond,
                         current_position_offset=cache_frames,
                         return_kv=True, chunk_size=chunk_size,
+                        **({} if kv_runtime is None else {'kv_context': kv_runtime.begin_forward(
+                            'cond', cache_frames, t_commit, commit=True)}),
                     )
                     cache_cond = self._append_kv_cache(cache_cond, kv_cond_new)
                     if use_cfg:
@@ -918,6 +1026,8 @@ class DiffusionForcingDenoiser(Denoiser):
                             past_kv_list=cache_uncond,
                             current_position_offset=cache_frames,
                             return_kv=True, chunk_size=chunk_size, cond_drop=commit_drop_uncond,
+                            **({} if kv_runtime is None else {'kv_context': kv_runtime.begin_forward(
+                                'uncond', cache_frames, t_commit, commit=True)}),
                         )
                         cache_uncond = self._append_kv_cache(cache_uncond, kv_uncond_new)
                     cache_frames += commit_frames.shape[2]
@@ -937,6 +1047,11 @@ class DiffusionForcingDenoiser(Denoiser):
                                     sink_frames=sink_frames,
                                 )
                             cache_frames -= drop
+
+                    if kv_runtime is not None:
+                        cache_cond = kv_runtime.compact(cache_cond, cache_frames, branch='cond')
+                        if use_cfg:
+                            cache_uncond = kv_runtime.compact(cache_uncond, cache_frames, branch='uncond')
 
                     committed_chunks.add(ci)
                     _print0(f"[StreamingGen]   committed chunk {ci}/{total_chunks} | "
@@ -977,22 +1092,47 @@ class DiffusionForcingDenoiser(Denoiser):
                         :, :, win_sf:win_sf + ctx_in_inflight
                     ]
 
+                headcast_cond = None if headcast is None else headcast.begin_forward('cond', cache_frames, t_frame)
+                headcast_cond_kwargs = {} if headcast_cond is None else {'headcast_context': headcast_cond}
+                kv_cond = None if kv_runtime is None else kv_runtime.begin_forward('cond', cache_frames, t_frame)
+                if kv_cond is not None:
+                    headcast_cond_kwargs['kv_context'] = kv_cond
                 v_cond_pred, _ = net.forward_with_cache(
                     inflight_z, t_frame, inflight_cond,
                     past_kv_list=cache_cond,
                     current_position_offset=cache_frames,
                     return_kv=False, chunk_size=chunk_size,
+                    **headcast_cond_kwargs,
                 )
+                if headcast is not None:
+                    headcast.finish_forward(headcast_cond)
+                if kv_runtime is not None:
+                    kv_runtime.finish_forward(kv_cond)
                 if use_cfg:
                     inflight_uncond, inflight_drop_uncond = self._make_uncond(inflight_cond)
+                    headcast_uncond = headcast.begin_forward('uncond', cache_frames, t_frame) if headcast is not None else None
+                    headcast_uncond_kwargs = {} if headcast_uncond is None else {'headcast_context': headcast_uncond}
+                    kv_uncond = None if kv_runtime is None else kv_runtime.begin_forward('uncond', cache_frames, t_frame)
+                    if kv_uncond is not None:
+                        headcast_uncond_kwargs['kv_context'] = kv_uncond
                     v_uncond_pred, _ = net.forward_with_cache(
                         inflight_z, t_frame, inflight_uncond,
                         past_kv_list=cache_uncond,
                         current_position_offset=cache_frames,
                         return_kv=False, chunk_size=chunk_size, cond_drop=inflight_drop_uncond,
+                        **headcast_uncond_kwargs,
                     )
+                    if headcast is not None:
+                        headcast.finish_forward(headcast_uncond)
+                    if kv_runtime is not None:
+                        kv_runtime.finish_forward(kv_uncond)
                 else:
                     v_uncond_pred = None
+
+                if kv_runtime is not None:
+                    cache_cond = kv_runtime.compact(cache_cond, cache_frames, branch='cond')
+                    if use_cfg:
+                        cache_uncond = kv_runtime.compact(cache_uncond, cache_frames, branch='uncond')
 
                 update_mask_row = chunk_update_mask[step, win_sc:win_ec]
                 for lci in range(n_inflight):
@@ -1064,6 +1204,11 @@ class DiffusionForcingDenoiser(Denoiser):
                 return z_global, torch.cat(rgb_parts, dim=2)
             return z_global
         finally:
+            if kv_runtime is not None:
+                kv_runtime.record_storage(cache_cond, cache_uncond)
+                self.last_eval_meta['kv_acceleration'] = kv_runtime.summary()
+            if headcast is not None:
+                self.last_eval_meta['headcast'] = headcast.summary()
             if stream_decoder is not None:
                 stream_decoder.end()
 

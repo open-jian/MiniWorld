@@ -240,6 +240,8 @@ class Attention(nn.Module):
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
         cached_chunk_tokens: Optional[int] = None,
+        headcast=None,
+        kv_context=None,
     ):
         B, N, C = x.shape
         in_dtype = x.dtype
@@ -252,25 +254,38 @@ class Attention(nn.Module):
             k = rope(k)
 
         k_current, v_current = k, v
-        if past_kv is not None:
-            k_past, v_past = past_kv
-            k = torch.cat([k_past.to(dtype=k.dtype, device=k.device), k], dim=-2)
-            v = torch.cat([v_past.to(dtype=v.dtype, device=v.device), v], dim=-2)
-
-        if cached_chunk_tokens is not None:
-            if attn_mask is not None:
-                raise ValueError("cached_chunk_tokens cannot be combined with an arbitrary attention mask")
-            # Projection, QK norm, RoPE and KV concatenation remain shared by
-            # both backends; only the block-causal attention evaluation changes.
-            x = _chunkwise_flash_attention(q, k, v, cached_chunk_tokens)
-        elif attn_mask is None and past_kv is None:
-            # flash-attn fast path expects (B, N, num_heads, head_dim)
-            q = q.transpose(1, 2).to(torch.bfloat16)
-            k = k.transpose(1, 2).to(torch.bfloat16)
-            v = v.transpose(1, 2).to(torch.bfloat16)
-            x = flash_attn_func(q, k, v, causal=False).transpose(1, 2)
+        # Legacy HeadCast keeps clean commits dense. The explicit KV runtime
+        # also routes commits, returning only the current K/V for cache append.
+        if return_kv:
+            headcast = None
+        if kv_context is not None:
+            if headcast is not None:
+                raise ValueError('KV acceleration and legacy HeadCast cannot share a forward')
+            x = kv_context.attention(q, k_current, v_current, past_kv)
+        elif headcast is not None and headcast.routing:
+            # Route before concatenating history for all heads; the grouped
+            # backend packs only the keys needed by each selected group.
+            x = headcast.route(q, k_current, v_current, past_kv, headcast.chunk_tokens)
         else:
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            if past_kv is not None:
+                k_past, v_past = past_kv
+                k = torch.cat([k_past.to(dtype=k.dtype, device=k.device), k], dim=-2)
+                v = torch.cat([v_past.to(dtype=v.dtype, device=v.device), v], dim=-2)
+
+            if cached_chunk_tokens is not None:
+                if attn_mask is not None:
+                    raise ValueError("cached_chunk_tokens cannot be combined with an arbitrary attention mask")
+                x = _chunkwise_flash_attention(q, k, v, cached_chunk_tokens)
+            elif attn_mask is None and past_kv is None:
+                # flash-attn fast path expects (B, N, num_heads, head_dim)
+                q = q.transpose(1, 2).to(torch.bfloat16)
+                k = k.transpose(1, 2).to(torch.bfloat16)
+                v = v.transpose(1, 2).to(torch.bfloat16)
+                x = flash_attn_func(q, k, v, causal=False).transpose(1, 2)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            if headcast is not None:
+                headcast.observe(q, k, v, headcast.chunk_tokens, x)
 
         x = x.transpose(1, 2).reshape(B, N, C).to(in_dtype)
         x = self.proj_drop(self.proj(x))
@@ -579,6 +594,8 @@ class MiniWorldBlock(nn.Module):
         past_kv: Optional[Tuple[Tensor, Tensor]] = None,
         return_kv: bool = False,
         cached_chunk_tokens: Optional[int] = None,
+        headcast=None,
+        kv_context=None,
     ):
         mod = self.modulation(emb, shared_mod, pose_mod)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
@@ -590,6 +607,8 @@ class MiniWorldBlock(nn.Module):
             past_kv=past_kv,
             return_kv=return_kv,
             cached_chunk_tokens=cached_chunk_tokens,
+            headcast=headcast,
+            kv_context=kv_context,
         )
         if return_kv:
             attn_out, new_kv = attn_result
@@ -973,13 +992,22 @@ class MiniWorldModel(nn.Module):
         chunk_size: int = 1,
         cond_drop: Optional[Tensor] = None,
         use_chunk_flash_attn: bool = True,
+        headcast_context=None,
+        kv_context=None,
     ):
         """Streaming forward with optional KV cache injection (RoPE-only).
 
         Chunk FlashAttention replaces only the cached block-causal attention
-        kernel. Set ``use_chunk_flash_attn=False`` for the original masked SDPA
-        reference. Cache capacity, sink, chunk boundaries and RoPE are unchanged.
+        kernel. For the original masked SDPA reference, omit ``headcast_context``
+        and set ``use_chunk_flash_attn=False``. A supplied HeadCast context may
+        independently select grouped attention and its backend; this flag alone
+        does not disable HeadCast. Cache capacity, sink, chunk boundaries and
+        RoPE are unchanged.
         """
+        if return_kv:
+            headcast_context = None
+        if kv_context is not None and headcast_context is not None:
+            raise ValueError('KV acceleration and legacy HeadCast are mutually exclusive')
         b, c_in, t_cur, h_in, w_in = x.shape
         x = self.x_embedder(x)
 
@@ -994,6 +1022,21 @@ class MiniWorldModel(nn.Module):
         n_cur = grid_t_cur * tokens_per_frame
         assert x.shape[1] == n_cur, f"patch embed produced {x.shape[1]} tokens, expected {n_cur}"
 
+        routing_context = kv_context if kv_context is not None else headcast_context
+        if routing_context is not None:
+            runtime = routing_context.runtime
+            if (runtime.height, runtime.width, runtime.tpf) != (grid_h, grid_w, tokens_per_frame):
+                raise ValueError("HeadCast context spatial grid does not match this forward")
+            effective_chunk_size = max(1, int(chunk_size))
+            if (runtime.chunk_size != effective_chunk_size
+                    or runtime.chunk_tokens != tokens_per_frame * effective_chunk_size):
+                raise ValueError("HeadCast context chunk size does not match this forward")
+            if runtime.depth != self.depth or runtime.depth != len(self.blocks):
+                raise ValueError("HeadCast context depth does not match this model")
+            if (runtime.num_heads != self.num_heads
+                    or any(block.attn.num_heads != runtime.num_heads for block in self.blocks)):
+                raise ValueError("HeadCast context head count does not match this model")
+
         if past_kv_list is None:
             past_kv_list = [None] * self.depth
         assert len(past_kv_list) == self.depth
@@ -1001,7 +1044,15 @@ class MiniWorldModel(nn.Module):
         n_past = 0
         first_past = next((kv for kv in past_kv_list if kv is not None), None)
         if first_past is not None:
-            n_past = int(first_past[0].shape[-2])
+            if hasattr(first_past, 'logical_frames'):
+                if kv_context is None:
+                    raise ValueError('Compact KV cache requires its rollout KV context')
+                n_past = int(first_past.logical_frames) * tokens_per_frame
+                if any(kv is not None and kv.logical_frames != first_past.logical_frames
+                       for kv in past_kv_list):
+                    raise ValueError('Compact layer caches disagree on logical position')
+            else:
+                n_past = int(first_past[0].shape[-2])
             assert n_past == current_position_offset * tokens_per_frame, (
                 f"past token len {n_past} != offset*tokens_per_frame "
                 f"{current_position_offset * tokens_per_frame}"
@@ -1020,7 +1071,7 @@ class MiniWorldModel(nn.Module):
         )
         cached_chunk_tokens = tokens_per_frame * max(1, int(chunk_size)) if use_chunk_flash_attn else None
         attn_mask = None
-        if not use_chunk_flash_attn:
+        if not use_chunk_flash_attn and kv_context is None:
             attn_mask = _build_cached_block_causal_mask(
                 n_past=n_past,
                 n_cur=n_cur,
@@ -1045,6 +1096,8 @@ class MiniWorldModel(nn.Module):
                 x, emb_tok, shared_mod_tok, pose_mod_tok, feat_rope_current, attn_mask,
                 past_kv_list[idx], return_kv,
                 cached_chunk_tokens=cached_chunk_tokens,
+                headcast=None if headcast_context is None else headcast_context.for_layer(idx),
+                kv_context=None if kv_context is None else kv_context.for_layer(idx),
             )
             if return_kv:
                 x, new_kv_list[idx] = out

@@ -237,6 +237,40 @@ window, since streaming keeps the attention span bounded; `TOTAL_LEN=96` yields
 381 RGB frames from a 64-frame checkpoint. The two stream chunk counts trade
 quality against memory and latency.
 
+### Optional HeadCast attention
+
+HeadCast is disabled by default. Set `HEADCAST=1` with either sampling launcher,
+or add `--headcast` to `python -m miniworld.sample`, to enable one-time head
+classification after the history cache fills. The selected heads use shorter
+history or spatially tiled history while preserving chunk-causal visibility.
+The backing KV cache remains unchanged. See [HeadCast configuration and behavior](HEADCAST.md)
+for the calibration rules and MiniWorld-specific defaults.
+
+### Optional compact KV acceleration
+
+Set `KV_ACCELERATION=headcast-source` with either sampling launcher, or pass
+`--kv_acceleration headcast-source` to `python -m miniworld.sample`, for early head
+classification, physically compact temporal histories, spatial attention over
+past and current tokens, fused Triton QKV packing with shared scratch space,
+and batched chunk launches. The default is `off`;
+`dense`, `headcast`, `combined`, and `dummy` modes provide separate
+backend/method ablations. `headcast-source` uses the official cosine/spatial-score
+gates; `headcast` uses relative-RMSE and mean-cosine bounds.
+This option is mutually exclusive with legacy `HEADCAST=1`. See
+[compact KV architecture, configuration and validation](KV_ACCELERATION.md)
+for exact visibility rules, official-source references and implementation
+differences.
+The measured 72-latent-frame source-gate port saved 6.59% sampler time across
+two noise seeds; its output differs from the original. The faster Dummy
+ablation visibly changes the generated scene. See the measured results in
+the linked guide before choosing an approximate policy.
+
+`KV_ACCELERATION=forcing-kv` enables the independent Forcing-KV strategy:
+static heads retain the sink and immediate predecessor, while dynamic heads
+also retain low-similarity historical segments. It supports online head
+calibration and reusable MiniWorld profiles. See [Forcing-KV](FORCING_KV.md)
+for source details, settings, MiniWorld adaptations and validation.
+
 ### Custom camera trajectories
 
 A RealEstate10K-trained checkpoint can animate a single image with a procedural camera trajectory:
@@ -463,4 +497,3 @@ If you find MiniWorld useful in your research, please cite:
   year    = {2026}
 }
 ```
-
