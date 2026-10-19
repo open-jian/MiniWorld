@@ -29,6 +29,7 @@ The forward signature is designed for ``miniworld.denoiser.Denoiser``.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -46,6 +47,7 @@ from miniworld.optimization_config import OptimizationConfig, load_optimization_
 from miniworld.fused_norm_modulation import can_fuse_norm_modulation, fused_norm_modulation
 from miniworld.fused_residual_gate_add import can_fuse_residual_gate_add, fused_residual_gate_add
 from miniworld.fused_rope import can_fuse_rope, fused_rope
+from miniworld.fused_bias_swiglu import can_fuse_bias_swiglu_input, fused_bias_swiglu
 
 # FlexAttention is optional; disabled by default
 create_block_mask = None
@@ -229,9 +231,58 @@ class SwiGLUFFN(nn.Module):
         self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
         self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, use_fused: bool = False) -> Tensor:
+        if use_fused and _can_optimize_swiglu(self) and _can_fuse_swiglu_projection(self.w12, x):
+            # For the supported noncontiguous input, Linear already computes
+            # matmul followed by a separate BF16 bias add. Keep that same GEMM
+            # and move only the bias add into the SiLU/multiply kernel. Each
+            # original BF16 rounding boundary is retained inside the kernel.
+            projected = F.linear(x, self.w12.weight, None)
+            return self.w3(fused_bias_swiglu(projected, self.w12.bias))
         x1, x2 = self.w12(x).chunk(2, dim=-1)
         return self.w3(F.silu(x1) * x2)
+
+
+_BUILTIN_SWIGLU_FORWARD = SwiGLUFFN.forward
+_BUILTIN_LINEAR_FORWARD = nn.Linear.forward
+_LINEAR_FLATTEN_3D_AT_IMPORT = os.environ.get("TORCH_LINEAR_FLATTEN_3D", "0")
+_LINEAR_FLATTEN_3D_SEEN = False
+
+
+def _can_optimize_swiglu(mlp: nn.Module) -> bool:
+    # Keep old signatures and observer-visible arguments for custom modules.
+    return (
+        type(mlp) is SwiGLUFFN and type(mlp).forward is _BUILTIN_SWIGLU_FORWARD
+        and "forward" not in mlp.__dict__ and not mlp.training
+        and not torch.is_grad_enabled() and not _has_forward_observers(mlp)
+    )
+
+
+def _can_fuse_swiglu_projection(projection: nn.Module, x: Tensor) -> bool:
+    global _LINEAR_FLATTEN_3D_SEEN
+    # Calling F.linear directly would bypass Linear hooks and custom forwards.
+    # Parametrized Linear modules also have a different type and stay eager.
+    if (type(projection) is not nn.Linear or projection.training
+            or type(projection).forward is not _BUILTIN_LINEAR_FORWARD
+            or "forward" in projection.__dict__ or _has_forward_observers(projection)):
+        return False
+    # PyTorch can force contiguous Linear/addmm through this environment flag.
+    # That path fuses bias into GEMM and does not have our BF16 bias-add boundary.
+    # PyTorch caches this setting internally. Set it before process startup;
+    # changing it during execution is unsupported. Once an override is observed
+    # here, conservatively keep fusion disabled even if the flag is later removed.
+    if (_LINEAR_FLATTEN_3D_AT_IMPORT != "0"
+            or os.environ.get("TORCH_LINEAR_FLATTEN_3D", "0") != "0"):
+        _LINEAR_FLATTEN_3D_SEEN = True
+    if _LINEAR_FLATTEN_3D_SEEN:
+        return False
+    return can_fuse_bias_swiglu_input(x, projection.weight, projection.bias)
+
+
+def _swiglu(mlp: nn.Module, x: Tensor, use_fused: bool = False) -> Tensor:
+    if use_fused and _can_optimize_swiglu(mlp):
+        return mlp(x, use_fused=True)
+    return mlp(x)
 
 
 class PatchEmbed3D(nn.Module):
@@ -678,6 +729,7 @@ class MiniWorldBlock(nn.Module):
         conditioning_tokens_per_frame: Optional[int] = None,
         use_fused_norm_modulation: bool = False,
         use_fused_residual_gate_add: bool = False,
+        use_fused_bias_swiglu: bool = False,
     ):
         mod = self.modulation(emb, shared_mod, pose_mod, conditioning_tokens_per_frame)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
@@ -701,10 +753,12 @@ class MiniWorldBlock(nn.Module):
             x, attn_out, gate_msa, conditioning_tokens_per_frame,
             use_fused=use_fused_residual_gate_add and not self.training,
         )
-        mlp_out = self.mlp(_norm_modulate(
-            self.norm2, x, shift_mlp, scale_mlp,
-            conditioning_tokens_per_frame, use_fused_norm_modulation,
-        ))
+        mlp_out = _swiglu(
+            self.mlp, _norm_modulate(
+                self.norm2, x, shift_mlp, scale_mlp,
+                conditioning_tokens_per_frame, use_fused_norm_modulation,
+            ), use_fused_bias_swiglu and not self.training,
+        )
         x = _residual_gate_add(
             x, mlp_out, gate_mlp, conditioning_tokens_per_frame,
             use_fused=use_fused_residual_gate_add and not self.training,
@@ -1228,6 +1282,9 @@ class MiniWorldModel(nn.Module):
         # Residual fusion is independent of attention, conditioning, and norm
         # switches. The helper validates dtype/stride/grad eligibility per call.
         use_fused_residual_gate_add = self.optimization_config.fused_residual_gate_add and not self.training
+        # Only cached eval opts in. The FFN checks the actual Linear input layout
+        # before omitting its bias, so unsupported calls retain the original GEMM.
+        use_fused_bias_swiglu = self.optimization_config.fused_bias_swiglu and not self.training
         frame_ids = torch.arange(n_cur, device=x.device, dtype=torch.long) // tokens_per_frame
         emb_tok, shared_mod_tok, pose_mod_tok = self._build_conditioning(
             t, y, b, grid_t_cur, n_cur, frame_ids, x.device, x.dtype, cond_drop,
@@ -1244,6 +1301,7 @@ class MiniWorldModel(nn.Module):
                 conditioning_tokens_per_frame=conditioning_tokens_per_frame,
                 use_fused_norm_modulation=use_fused_norm_modulation,
                 use_fused_residual_gate_add=use_fused_residual_gate_add,
+                use_fused_bias_swiglu=use_fused_bias_swiglu,
             )
             if return_kv:
                 x, new_kv_list[idx] = out

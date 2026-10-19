@@ -46,3 +46,12 @@ fused_residual_gate_add = true
 # Training, enabled gradients, hooks/custom RoPE, and unsupported tensors fall back.
 # Set false to compare against the original rotation with all other switches fixed.
 fused_rope = true
+
+# Fuse W12's separate bias add, SiLU, and gated product in cached CUDA BF16 eval.
+# Keep the original matrix multiply and every BF16 bias/add/activation boundary;
+# intermediate bias-added and SiLU tensors are no longer written to memory.
+# Only the validated single-batch channel-major FP32 Linear input is eligible.
+# Training, gradients, hooks/custom modules, and other layouts/dtypes stay eager.
+# No weights, checkpoint keys, sampler settings, or persistent caches are changed.
+# Set false to compare against the accepted baseline with the other switches on.
+fused_bias_swiglu = true
