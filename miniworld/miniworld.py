@@ -45,6 +45,7 @@ from flash_attn import flash_attn_func
 from miniworld.optimization_config import OptimizationConfig, load_optimization_config
 from miniworld.fused_norm_modulation import can_fuse_norm_modulation, fused_norm_modulation
 from miniworld.fused_residual_gate_add import can_fuse_residual_gate_add, fused_residual_gate_add
+from miniworld.fused_rope import can_fuse_rope, fused_rope
 
 # FlexAttention is optional; disabled by default
 create_block_mask = None
@@ -435,11 +436,16 @@ class VisionRotaryEmbeddingFast3D(nn.Module):
 
     def forward(
         self, t: Tensor, num_frames_override: Optional[int] = None, start_frame: int = 0,
-        freqs: Optional[Tuple[Tensor, Tensor]] = None,
+        freqs: Optional[Tuple[Tensor, Tensor]] = None, use_fused: bool = False,
     ) -> Tensor:
         num_frames = num_frames_override if num_frames_override is not None else self._num_frames
         cos, sin = (self._get_freqs(num_frames, t.device, start_frame=start_frame)
                     if freqs is None else freqs)
+        # Fuse arithmetic only after the original coefficient lookup. Its BF16
+        # dynamic tables and FP32 checkpoint-table branch must remain unchanged.
+        # Cached eval opts in explicitly; ordinary forward/training stays eager.
+        if use_fused and not self.training and can_fuse_rope(t, cos, sin):
+            return fused_rope(t, cos, sin)
         return t * cos + rotate_half(t) * sin
 
     def rope_shift_time(self, delta: int, cached: Tensor) -> Tensor:
@@ -471,6 +477,11 @@ class VisionRotaryEmbeddingFast3D(nn.Module):
         sin_full = torch.cat([sin_t, sin_rest], dim=-1).to(out_dtype)
 
         return cached * cos_full + rotate_half(cached) * sin_full
+
+
+# A class-level forward replacement may still implement the earlier signature.
+# Only the built-in method accepts the new arithmetic-fusion opt-in keyword.
+_BUILTIN_ROPE_FORWARD = VisionRotaryEmbeddingFast3D.forward
 
 
 # --------------------------------------------------------------------------- #
@@ -1160,12 +1171,16 @@ class MiniWorldModel(nn.Module):
                 dtype=x.dtype,
             )
 
-        reuse_rope_frequencies = (
-            self.optimization_config.reuse_rope_frequencies
-            and not self.training and not torch.is_grad_enabled()
+        can_optimize_rope = (
+            not self.training and not torch.is_grad_enabled()
             and type(self.feat_rope) is VisionRotaryEmbeddingFast3D
             and "forward" not in self.feat_rope.__dict__
             and not _has_forward_observers(self.feat_rope)
+        )
+        reuse_rope_frequencies = self.optimization_config.reuse_rope_frequencies and can_optimize_rope
+        use_fused_rope = (
+            self.optimization_config.fused_rope and can_optimize_rope
+            and type(self.feat_rope).forward is _BUILTIN_ROPE_FORWARD
         )
         # Q/K and every layer use the same current-frame positions. Build the
         # frequency tensors lazily in the original autocast context, through
@@ -1175,15 +1190,25 @@ class MiniWorldModel(nn.Module):
         rope_freqs: Dict[torch.device, Tuple[Tensor, Tensor]] = {}
 
         def feat_rope_current(tt: Tensor) -> Tensor:
+            freqs = None
             if reuse_rope_frequencies:
                 if tt.device not in rope_freqs:
                     rope_freqs[tt.device] = self.feat_rope._get_freqs(
                         grid_t_cur, tt.device, start_frame=int(current_position_offset),
                     )
+                freqs = rope_freqs[tt.device]
+            if use_fused_rope:
                 return self.feat_rope(
                     tt, num_frames_override=grid_t_cur, start_frame=int(current_position_offset),
-                    freqs=rope_freqs[tt.device],
+                    freqs=freqs, use_fused=True,
                 )
+            if reuse_rope_frequencies:
+                return self.feat_rope(
+                    tt, num_frames_override=grid_t_cur, start_frame=int(current_position_offset),
+                    freqs=freqs,
+                )
+            # Custom forwards and hooks retain the pre-optimization arguments;
+            # do not pass new keywords to extensions that may not accept them.
             return self.feat_rope(tt, num_frames_override=grid_t_cur, start_frame=int(current_position_offset))
 
         # Eligibility is structural: never inspect timestep values on the GPU

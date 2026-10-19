@@ -37,12 +37,14 @@ class OptimizationConfig:
     reuse_rope_frequencies: bool = True
     # Fuse BF16 residual gating/addition without removing the product's rounding.
     fused_residual_gate_add: bool = True
+    # Fuse current Q/K rotation arithmetic; frequency reuse remains independent.
+    fused_rope: bool = True
 
     def __post_init__(self) -> None:
         # bool("false") is True: never coerce strings/numbers into switches.
         for name in (
             "chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation",
-            "reuse_rope_frequencies", "fused_residual_gate_add",
+            "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope",
         ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a TOML/Python boolean")
@@ -56,6 +58,7 @@ class OptimizationConfig:
             "fused_norm_modulation": self.fused_norm_modulation,
             "reuse_rope_frequencies": self.reuse_rope_frequencies,
             "fused_residual_gate_add": self.fused_residual_gate_add,
+            "fused_rope": self.fused_rope,
         }
 
     def snapshot(self) -> dict:
@@ -81,7 +84,7 @@ def load_optimization_config(
         values = tomllib.load(stream)
     unknown = set(values) - {
         "schema_version", "chunkwise_flash_attention", "framewise_conditioning", "fused_norm_modulation",
-        "reuse_rope_frequencies", "fused_residual_gate_add",
+        "reuse_rope_frequencies", "fused_residual_gate_add", "fused_rope",
     }
     if unknown:
         raise ValueError(f"Unknown optimization config keys in {path}: {', '.join(sorted(unknown))}")
@@ -95,4 +98,5 @@ def load_optimization_config(
         fused_norm_modulation=values.get("fused_norm_modulation", True),
         reuse_rope_frequencies=values.get("reuse_rope_frequencies", True),
         fused_residual_gate_add=values.get("fused_residual_gate_add", True),
+        fused_rope=values.get("fused_rope", True),
     )

@@ -38,3 +38,11 @@ reuse_rope_frequencies = true
 # Unsupported inputs, training, and gradient-enabled calls use the original path.
 # Set false for an independent comparison with all other switches unchanged.
 fused_residual_gate_add = true
+
+# Fuse current Q/K rotation into one kernel per tensor in eligible cached eval.
+# Consume the original cos/sin coefficients and preserve FP32 product/add rounding
+# and output layout. Frequency reuse has its own independent switch above.
+# This does not fuse QK normalization, K concatenation/casting, or cache rebasing.
+# Training, enabled gradients, hooks/custom RoPE, and unsupported tensors fall back.
+# Set false to compare against the original rotation with all other switches fixed.
+fused_rope = true
