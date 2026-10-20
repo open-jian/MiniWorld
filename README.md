@@ -237,6 +237,41 @@ window, since streaming keeps the attention span bounded; `TOTAL_LEN=96` yields
 381 RGB frames from a 64-frame checkpoint. The two stream chunk counts trade
 quality against memory and latency.
 
+### TeaCache controls
+
+With the default `MODEL=1B`, both sampling scripts enable TeaCache at threshold
+`0.4`. The DROID launcher loads the bundled
+[DROID profile](profiling_config/teacache_profiles/miniworld_1b_droid.json), and
+the RealEstate10K launcher loads the bundled
+[RealEstate10K profile](profiling_config/teacache_profiles/miniworld_1b_re10k.json).
+TeaCache reuses transformer residuals between denoising steps; lowering the
+threshold reduces reuse for a more conservative quality/speed tradeoff.
+
+Either script accepts these environment variables and command-line overrides:
+
+```bash
+# Disable TeaCache
+TEACACHE=0 bash scripts/sample_droid.sh
+bash scripts/sample_re10k.sh --no-teacache
+
+# Lower the threshold
+TEACACHE_THRESHOLD=0.1 bash scripts/sample_droid.sh
+bash scripts/sample_re10k.sh --teacache_threshold 0.1
+```
+
+Both scripts forward `"$@"` last and resolve TeaCache's automatic default after
+the final CLI options and checkpoint metadata are loaded. The checkpoint's
+model scale takes precedence when available. Selecting HeadCast or a KV mode
+other than `off`, through environment variables or CLI flags, defaults TeaCache
+to off; explicitly combining TeaCache with either is rejected. Models other than `1B` also
+default to off because the bundled profiles are calibrated for `1B`; use
+`TEACACHE=1 TEACACHE_PROFILE=/path/to/profile.json` to enable a custom profile.
+A custom profile's saved threshold is used unless `TEACACHE_THRESHOLD` or
+`--teacache_threshold` overrides it.
+Direct `python -m miniworld.sample` remains opt-in: `--teacache` selects the
+dataset's bundled `1B` profile automatically, while other model scales require
+an explicit `--teacache_profile`.
+
 ### Optional HeadCast attention
 
 HeadCast is disabled by default. Set `HEADCAST=1` with either sampling launcher,

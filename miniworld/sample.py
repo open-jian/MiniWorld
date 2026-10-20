@@ -109,12 +109,15 @@ def build_denoiser(args: argparse.Namespace):
 
 
 def read_checkpoint(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, object]]:
-    """Read EMA weights and metadata without touching the model."""
+    """Read wrapped training checkpoints or exported tensor state dicts."""
     ckpt = torch.load(path, map_location="cpu")
-    weights = ckpt.get("ema_model", ckpt.get("model"))
-    if weights is None:
-        raise ValueError(f"Checkpoint has neither ema_model nor model: {path}")
-    return weights, ckpt.get("meta", {})
+    if isinstance(ckpt, dict):
+        weights = ckpt.get("ema_model", ckpt.get("model"))
+        if weights is not None:
+            return weights, ckpt.get("meta", {})
+        if ckpt and all(isinstance(value, torch.Tensor) for value in ckpt.values()):
+            return ckpt, {}
+    raise ValueError(f"Checkpoint must contain ema_model/model or be a tensor state dict: {path}")
 
 
 def resolve_latent_frames(weights: Dict[str, torch.Tensor], meta: Dict[str, object], args: argparse.Namespace) -> int:
@@ -151,6 +154,35 @@ def resolve_wm_model(meta: Dict[str, object], args: argparse.Namespace) -> str:
     if recorded != args.wm_model:
         print0(f"[Checkpoint] wm_model={recorded} from metadata overrides --wm_model {args.wm_model}")
     return recorded
+
+
+def resolve_teacache(args: argparse.Namespace) -> None:
+    """Resolve launcher defaults after CLI overrides and checkpoint metadata."""
+    other_acceleration = args.headcast or args.kv_acceleration != "off"
+    if args.teacache is None:
+        args.teacache = bool(
+            args.teacache_auto and args.wm_model == "1B"
+            and not other_acceleration and not args.teacache_calibration
+        )
+    if not (args.teacache or args.teacache_calibration):
+        print0("[TeaCache] disabled")
+        return
+    if other_acceleration:
+        raise ValueError("TeaCache must be used separately from HeadCast/KV acceleration")
+    if args.teacache and not args.teacache_calibration and not args.teacache_profile:
+        if args.wm_model != "1B":
+            raise ValueError("TeaCache for models other than 1B requires --teacache_profile")
+        args.teacache_profile = str(
+            Path(__file__).resolve().parents[1] / "profiling_config" / "teacache_profiles"
+            / f"miniworld_1b_{args.dataset}.json"
+        )
+    from miniworld.teacache import DEFAULT_TEACACHE_THRESHOLD
+    profile = json.loads(Path(args.teacache_profile).read_text()) if args.teacache_profile else {}
+    if args.teacache_threshold is None:
+        args.teacache_threshold = profile.get("threshold", DEFAULT_TEACACHE_THRESHOLD)
+    mode = "calibration (no reuse)" if args.teacache_calibration else "enabled"
+    print0(f"[TeaCache] {mode}, threshold={args.teacache_threshold}, "
+           f"profile={args.teacache_profile or '(none)'}")
 
 
 def load_weights(weights: Dict[str, torch.Tensor], denoiser: torch.nn.Module) -> None:
@@ -318,10 +350,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream_sink_size", type=int, default=1)
     parser.add_argument("--headcast", action="store_true",
                         help="Enable experimental one-time head classification and grouped history attention (default: off).")
-    parser.add_argument("--teacache", action="store_true",
-                        help="Enable independent TeaCache trunk-residual reuse (default: off).")
+    parser.add_argument("--teacache", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable/disable independent TeaCache trunk-residual reuse (direct Python default: off).")
+    parser.add_argument("--teacache_auto", action="store_true",
+                        help="Launcher default: enable TeaCache for 1B unless another acceleration mode is selected. "
+                             "Explicit --teacache/--no-teacache takes precedence.")
     parser.add_argument("--teacache_profile", default="",
-                        help="MiniWorld calibration JSON: coefficients, threshold and optional reuse cap.")
+                        help="MiniWorld calibration JSON; when enabled, 1B defaults to the selected dataset's bundled profile.")
     parser.add_argument("--teacache_threshold", type=float, default=None,
                         help="Override the profile refresh threshold; bundled profiles and the fallback use 0.4. "
                              "Lower it (e.g. 0.2, 0.1 or 0.05) if quality loss or visible drift is too large; "
@@ -389,6 +424,7 @@ def main() -> None:
     args.latent_frames = resolve_latent_frames(weights, meta, args)
     args.wm_model = resolve_wm_model(meta, args)
     print0(f"[Checkpoint] {args.checkpoint}: wm_model={args.wm_model}, latent_frames={args.latent_frames}")
+    resolve_teacache(args)
     denoiser = build_denoiser(args).to(device).eval()
     load_weights(weights, denoiser)
     if int(meta.get("trained_num_frames", 0)) > 0:

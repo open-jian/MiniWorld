@@ -31,6 +31,23 @@ if [[ "${KV_ACCELERATION:-off}" == "forcing-kv" ]]; then
   fi
 fi
 
+# Resolve automatic enablement/profile selection in Python after CLI overrides
+# and checkpoint metadata. See miniworld/teacache.py for measured quality changes.
+teacache_args=()
+# Bundled profiles default to 0.4; preserve a custom profile's saved threshold.
+if [[ -n "${TEACACHE_THRESHOLD:-}" ]]; then
+  teacache_args+=(--teacache_threshold "${TEACACHE_THRESHOLD}")
+fi
+case "${TEACACHE:-auto}" in
+  auto) teacache_args+=(--teacache_auto) ;;
+  1) teacache_args+=(--teacache) ;;
+  0) teacache_args+=(--no-teacache) ;;
+  *) echo "TEACACHE must be auto, 1, or 0" >&2; exit 2 ;;
+esac
+if [[ -n "${TEACACHE_PROFILE:-}" ]]; then
+  teacache_args+=(--teacache_profile "${TEACACHE_PROFILE}")
+fi
+
 CUDA_VISIBLE_DEVICES="${GPU}" python -m miniworld.sample \
   --dataset droid \
   --data_root "${DATA_ROOT}" \
@@ -48,4 +65,4 @@ CUDA_VISIBLE_DEVICES="${GPU}" python -m miniworld.sample \
   --cfg_scale "${CFG_SCALE:-2.0}" \
   --num_sampling_steps "${NUM_SAMPLING_STEPS:-100}" \
   --sample_num_videos "${SAMPLE_NUM_VIDEOS:-50}" \
-  "${headcast_args[@]}" "${forcing_kv_args[@]}"
+  "${headcast_args[@]}" "${forcing_kv_args[@]}" "${teacache_args[@]}" "$@"
