@@ -318,6 +318,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream_sink_size", type=int, default=1)
     parser.add_argument("--headcast", action="store_true",
                         help="Enable experimental one-time head classification and grouped history attention (default: off).")
+    parser.add_argument("--teacache", action="store_true",
+                        help="Enable independent TeaCache trunk-residual reuse (default: off).")
+    parser.add_argument("--teacache_profile", default="",
+                        help="MiniWorld calibration JSON: coefficients, threshold and optional reuse cap.")
+    parser.add_argument("--teacache_threshold", type=float, default=None,
+                        help="Override the profile refresh threshold; bundled profiles and the fallback use 0.4. "
+                             "Lower it (e.g. 0.2, 0.1 or 0.05) if quality loss or visible drift is too large; "
+                             "smaller values refresh more often and reduce speedup.")
+    parser.add_argument("--teacache_max_reuse_steps", type=int, default=None,
+                        help="Override the profile consecutive reuse cap; 0 disables the cap.")
+    parser.add_argument("--teacache_calibration", action="store_true",
+                        help="Collect input/output changes with complete computation; never reuse.")
+    parser.add_argument("--teacache_trace_output", default="",
+                        help="Enable per-forward decision/frame tracing and write JSON for TeaCache or calibration.")
+    parser.add_argument("--teacache_trace", action="store_true",
+                        help="Collect per-forward TeaCache decisions in last_eval_meta (default: off).")
     parser.add_argument("--headcast_tile_height", type=int, default=5)
     parser.add_argument("--headcast_tile_width", type=int, default=5)
     parser.add_argument("--headcast_recent_chunks", type=int, default=2)
@@ -429,6 +445,14 @@ def main() -> None:
             )
             gen_sec = time.perf_counter() - start
             pred_latents, pred_rgb = result
+
+        if args.teacache or args.teacache_calibration:
+            summary = denoiser.last_eval_meta['teacache']
+            print0(
+                f"[TeaCache] sample={idx}, mode={summary['mode']}, "
+                f"reused={summary['reused_forwards']}/{summary['denoising_forwards']}, "
+                f"full_kv_writes={summary['commit_forwards']}"
+            )
 
         if args.headcast:
             summary = denoiser.last_eval_meta["headcast"]

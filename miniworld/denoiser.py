@@ -132,6 +132,19 @@ class DenoiserConfig:
         self.forcing_kv_profile_output: str = ''
         self.forcing_kv_model_identity: str = ''
 
+        # TeaCache is a separate, opt-in trunk-residual reuse path. A rollout
+        # owns all state; disabled inference does not import its runtime.
+        self.teacache: bool = False
+        # None inherits the profile or the 0.4 default. See miniworld/teacache.py
+        # for measured DROID/RE10K quality changes; set a smaller value if needed.
+        self.teacache_threshold: Optional[float] = None
+        self.teacache_coefficients: tuple = ()
+        self.teacache_profile: str = ''
+        self.teacache_calibration: bool = False
+        self.teacache_trace: bool = False
+        self.teacache_trace_output: str = ''
+        self.teacache_max_reuse_steps: Optional[int] = None
+
         for k, v in kwargs.items():
             if hasattr(self, k):
                 setattr(self, k, v)
@@ -751,6 +764,32 @@ class DiffusionForcingDenoiser(Denoiser):
 
         use_cfg = float(self.cfg_scale) > 1.0
         depth = net.depth
+        teacache = None
+        tea_history_epoch = 0
+        if self.cfg.teacache or self.cfg.teacache_calibration:
+            if self.cfg.headcast or self.cfg.kv_acceleration != 'off':
+                raise ValueError('TeaCache must be used separately from HeadCast/KV acceleration')
+            from miniworld.teacache import (
+                DEFAULT_TEACACHE_THRESHOLD, TeaCacheConfig, TeaCacheContext, TeaCacheRuntime)
+            coefficients = self.cfg.teacache_coefficients
+            profile = {}
+            if self.cfg.teacache_profile:
+                import json
+                from pathlib import Path
+                profile = json.loads(Path(self.cfg.teacache_profile).read_text())
+                coefficients = profile['coefficients']
+            threshold = (profile.get('threshold', DEFAULT_TEACACHE_THRESHOLD)
+                         if self.cfg.teacache_threshold is None
+                         else self.cfg.teacache_threshold)
+            max_reuse_steps = (profile.get('max_reuse_steps', 0)
+                               if self.cfg.teacache_max_reuse_steps is None
+                               else self.cfg.teacache_max_reuse_steps)
+            teacache = TeaCacheRuntime(
+                TeaCacheConfig(enabled=True, threshold=threshold,
+                    coefficients=tuple(coefficients), calibration=self.cfg.teacache_calibration,
+                    trace=bool(self.cfg.teacache_trace or self.cfg.teacache_trace_output),
+                    max_reuse_steps=max_reuse_steps),
+                branches=('cond', 'uncond') if use_cfg else ('cond',))
         kv_runtime = None
         if self.cfg.kv_acceleration == 'forcing-kv':
             if self.cfg.headcast:
@@ -884,6 +923,41 @@ class DiffusionForcingDenoiser(Denoiser):
         if stream_decoder is not None:
             stream_decoder.begin()
 
+        tea_trace_enabled = teacache is not None and teacache.config.trace
+        tea_trace_schedule = None
+        tea_update_counts = [0] * total_len if tea_trace_enabled else None
+
+        def _tea_trace_metadata(phase, start, end, outer_step=None):
+            if not tea_trace_enabled:
+                return None
+            frame_ids = list(range(start, end))
+            current, following, active = [], [], []
+            for frame in frame_ids:
+                if phase != 'denoise' or frame < ctx_len:
+                    t, t_next, updated = 0., 0., False
+                else:
+                    trace_t, trace_next, trace_mask = tea_trace_schedule
+                    ci = frame // chunk_size
+                    t, t_next = trace_t[outer_step][ci], trace_next[outer_step][ci]
+                    updated = bool(trace_mask[outer_step][ci] and t_next != t)
+                current.append(t)
+                following.append(t_next)
+                active.append(updated)
+                if updated:
+                    tea_update_counts[frame] += 1
+            return dict(phase=phase, outer_step=outer_step, num_layers=depth,
+                latent_frame_ids=frame_ids,
+                latent_update_mask=active,
+                updated_latent_frames=[frame for frame, update in zip(frame_ids, active) if update],
+                context_latent_frames=[frame for frame in frame_ids if frame < ctx_len],
+                pending_latent_frames=[frame for frame, t_next, update in zip(frame_ids, following, active)
+                                       if frame >= ctx_len and not update and t_next > 0.],
+                finished_latent_frames=[frame for frame, t_next, update in zip(frame_ids, following, active)
+                                        if frame >= ctx_len and not update and t_next <= 0.],
+                timestep=current, next_timestep=following,
+                denoise_update_indices=[tea_update_counts[frame] if update else None
+                                        for frame, update in zip(frame_ids, active)])
+
         try:
             # --- Pre-fill cache with clean history context ---
             # Only fully-aligned ctx chunks go into the cache. Sub-chunk leftover
@@ -898,6 +972,9 @@ class DiffusionForcingDenoiser(Denoiser):
                     ctx_frames, ctx_t, ctx_cond,
                     past_kv_list=None, current_position_offset=0,
                     return_kv=True, chunk_size=chunk_size,
+                    **({} if teacache is None else {'teacache_context': TeaCacheContext(
+                        teacache, 'cond', (0, n_full_ctx_frames, tea_history_epoch), True,
+                        _tea_trace_metadata('prefill', 0, n_full_ctx_frames))}),
                 )
                 cache_cond = list(kv_cond_ctx)
                 if use_cfg:
@@ -906,6 +983,9 @@ class DiffusionForcingDenoiser(Denoiser):
                         ctx_frames, ctx_t, ctx_uncond,
                         past_kv_list=None, current_position_offset=0,
                         return_kv=True, chunk_size=chunk_size, cond_drop=ctx_drop_uncond,
+                        **({} if teacache is None else {'teacache_context': TeaCacheContext(
+                            teacache, 'uncond', (0, n_full_ctx_frames, tea_history_epoch), True,
+                            _tea_trace_metadata('prefill', 0, n_full_ctx_frames))}),
                     )
                     cache_uncond = list(kv_uncond_ctx)
                 cache_frames = n_full_ctx_frames
@@ -938,6 +1018,11 @@ class DiffusionForcingDenoiser(Denoiser):
             valid_intervals = self._compute_fifo_valid_intervals(
                 chunk_update_mask, total_chunks, max_chunks_in_window=inflight_chunks,
             )
+            if tea_trace_enabled:
+                # Trace-only copy of the fixed schedule, once per rollout. No
+                # extra tensor reduction is added to the inference gate.
+                tea_trace_schedule = tuple(value.detach().cpu().tolist() for value in
+                    (t_chunk_sched, t_next_chunk_sched, chunk_update_mask))
 
             num_outer_steps = t_chunk_sched.shape[0]
             self._set_last_eval_meta(
@@ -1017,6 +1102,9 @@ class DiffusionForcingDenoiser(Denoiser):
                         return_kv=True, chunk_size=chunk_size,
                         **({} if kv_runtime is None else {'kv_context': kv_runtime.begin_forward(
                             'cond', cache_frames, t_commit, commit=True)}),
+                        **({} if teacache is None else {'teacache_context': TeaCacheContext(
+                            teacache, 'cond', (gsl.start, gsl.stop, tea_history_epoch), True,
+                            _tea_trace_metadata('kv_commit', gsl.start, gsl.stop, step))}),
                     )
                     cache_cond = self._append_kv_cache(cache_cond, kv_cond_new)
                     if use_cfg:
@@ -1028,6 +1116,9 @@ class DiffusionForcingDenoiser(Denoiser):
                             return_kv=True, chunk_size=chunk_size, cond_drop=commit_drop_uncond,
                             **({} if kv_runtime is None else {'kv_context': kv_runtime.begin_forward(
                                 'uncond', cache_frames, t_commit, commit=True)}),
+                            **({} if teacache is None else {'teacache_context': TeaCacheContext(
+                                teacache, 'uncond', (gsl.start, gsl.stop, tea_history_epoch), True,
+                                _tea_trace_metadata('kv_commit', gsl.start, gsl.stop, step))}),
                         )
                         cache_uncond = self._append_kv_cache(cache_uncond, kv_uncond_new)
                     cache_frames += commit_frames.shape[2]
@@ -1054,6 +1145,8 @@ class DiffusionForcingDenoiser(Denoiser):
                             cache_uncond = kv_runtime.compact(cache_uncond, cache_frames, branch='uncond')
 
                     committed_chunks.add(ci)
+                    if teacache is not None:
+                        tea_history_epoch += 1
                     _print0(f"[StreamingGen]   committed chunk {ci}/{total_chunks} | "
                             f"cache_frames={cache_frames} | step={step}/{num_outer_steps}")
                     last_win_sc += 1
@@ -1097,6 +1190,11 @@ class DiffusionForcingDenoiser(Denoiser):
                 kv_cond = None if kv_runtime is None else kv_runtime.begin_forward('cond', cache_frames, t_frame)
                 if kv_cond is not None:
                     headcast_cond_kwargs['kv_context'] = kv_cond
+                if teacache is not None:
+                    tea_trace_metadata = _tea_trace_metadata('denoise', win_sf, win_ef, step)
+                    headcast_cond_kwargs['teacache_context'] = TeaCacheContext(
+                        teacache, 'cond', (win_sf, win_ef, tea_history_epoch),
+                        step == num_outer_steps - 1, tea_trace_metadata)
                 v_cond_pred, _ = net.forward_with_cache(
                     inflight_z, t_frame, inflight_cond,
                     past_kv_list=cache_cond,
@@ -1115,6 +1213,10 @@ class DiffusionForcingDenoiser(Denoiser):
                     kv_uncond = None if kv_runtime is None else kv_runtime.begin_forward('uncond', cache_frames, t_frame)
                     if kv_uncond is not None:
                         headcast_uncond_kwargs['kv_context'] = kv_uncond
+                    if teacache is not None:
+                        headcast_uncond_kwargs['teacache_context'] = TeaCacheContext(
+                            teacache, 'uncond', (win_sf, win_ef, tea_history_epoch),
+                            step == num_outer_steps - 1, tea_trace_metadata)
                     v_uncond_pred, _ = net.forward_with_cache(
                         inflight_z, t_frame, inflight_uncond,
                         past_kv_list=cache_uncond,
@@ -1204,6 +1306,15 @@ class DiffusionForcingDenoiser(Denoiser):
                 return z_global, torch.cat(rgb_parts, dim=2)
             return z_global
         finally:
+            if teacache is not None:
+                tea_summary = teacache.summary()
+                self.last_eval_meta['teacache'] = tea_summary
+                if self.cfg.teacache_trace_output:
+                    import json
+                    from pathlib import Path
+                    trace_path = Path(self.cfg.teacache_trace_output)
+                    trace_path.parent.mkdir(parents=True, exist_ok=True)
+                    trace_path.write_text(json.dumps(tea_summary, indent=2))
             if kv_runtime is not None:
                 kv_runtime.record_storage(cache_cond, cache_uncond)
                 self.last_eval_meta['kv_acceleration'] = kv_runtime.summary()

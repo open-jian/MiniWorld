@@ -1,0 +1,42 @@
+{
+  "coefficients": [
+    -300487.38511465065,
+    25026.59661793576,
+    -608.8037377445693,
+    3.8631044799427263,
+    0.05484787434843066
+  ],
+  "fit_metadata": {
+    "requested_degree": 4,
+    "degree": 4,
+    "samples": 340,
+    "input_min": 0.0013633562484756112,
+    "input_max": 0.041559576988220215,
+    "target": "output_relative_l1",
+    "mae": 0.013041017247456991,
+    "rmse": 0.019398462402433692,
+    "prediction_clamp": "nonnegative",
+    "note": "Dense-trace fit; validate quality and E2E speed in closed-loop inference"
+  },
+  "dataset": "re10k",
+  "max_reuse_steps": 0,
+  "calibration_episode": "00182dd4c74ab052",
+  "calibration_latents": 64,
+  "checkpoints": {
+    "checkpoint": "/home/jian/WM-RL/MiniWorld/checkpoints/miniworld/MiniWorld_1b_re10k.pt",
+    "vae_checkpoint": "/data2/jian/checkpoints/miniworld/Wan2.2_VAE.pth"
+  },
+  "sampler": {
+    "total_len": 64,
+    "history_len": 1,
+    "max_cache_chunks": 24,
+    "inflight_chunks": 8,
+    "sink_frames": 1,
+    "collect_stream_timing": false
+  },
+  "threshold": 0.4,
+  "calibration_source": "/data/jian/codex_outputs/MiniWorld/teacache_cross_dataset_20261019/re10k_calibration/teacache_profile.json",
+  "calibration_profile_sha256": "558534c640de4bfac33b7fcb77ddd1a57012acfe0f627e4c50fe98a964e6e885",
+  "scope": "MiniWorld 1B RE10K; native RE10K fit on a separate training clip, 15x20 latent grid, chunk2/inflight8/history48. Coefficients unchanged from the measured cross-dataset sweep.",
+  "threshold_note": "Speed-oriented 0.4 default. If quality loss or visible drift is too large, lower --teacache_threshold; see miniworld/teacache.py for measured DROID/RE10K quality changes."
+}

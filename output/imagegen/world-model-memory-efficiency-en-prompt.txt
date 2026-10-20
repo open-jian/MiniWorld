@@ -1,0 +1,89 @@
+Use case: text-localization.
+Edit the provided research roadmap image. The image is the edit target, and the user likes its design. Change ALL Chinese text to fluent, concise academic English. The final image must be entirely in English, with NO Chinese characters anywhere. Preserve the original 16:9 composition, central memory hub, six-panel positions, all six numbered badges, schematic drawings, connections, blue palette, coral-red emphasis on panels 03 and 04, and all existing English direction titles and method names. Do not redesign or remove any panels. Adjust font sizes and wrap translated captions only as needed for clear, unclipped typography. Keep the original hierarchy and ample spacing.
+
+Use the following complete English text. Ensure every visible Chinese label in every diagram is replaced; these are the authoritative replacement texts.
+
+Main title, unchanged: "World Model Memory Efficiency"
+Replace the Chinese subtitle with: "A Research Roadmap Across Six Directions"
+
+CENTRAL HUB:
+"World Model"
+"Memory System"
+Small caption in two lines: "Historical KV" / "Intermediate Features"
+Goal below the hub, in two lines:
+"Lower Storage, Memory Access"
+"and Compute Costs"
+
+PANEL 01, upper left:
+"01"
+"Pruning / Eviction"
+Question: "Which history can be discarded?"
+Diagram input label: "Cached Historical KV"
+Diagram output label: "Retained Historical KV"
+Technical caption: "Evict history by token, block, or attention head"
+Method list, unchanged:
+"WorldKV · Deep Forcing · SnapKV"
+"ChunkKV · FrameFusion"
+
+PANEL 02, middle left:
+"02"
+"Merge"
+Question: "Which information can be merged?"
+Diagram input label: "Similar Historical Tokens"
+Arrow label: "Merge"
+Diagram output label: "Fewer Summary Tokens"
+Technical caption: "Hidden-state token merging vs. direct KV merging"
+Method list: "FrameFusion · CaM"
+
+PANEL 03, lower left:
+"03"
+"Selective History Access"
+Question: "Which history does the current step need?"
+Query box: "Query" / "(Current Step)"
+Memory grid caption: "Historical KV Cache"
+Red legend: "Accessed History"
+Blue legend: "Unaccessed History"
+Technical captions, unchanged:
+"Sparse Attention · KV Cache Selection"
+"KV Cache Budget Allocation"
+Method list:
+"Dummy Forcing · HeadCast"
+"Forcing-KV · ISPA"
+
+PANEL 04, upper right:
+"04"
+"Reuse / Prediction"
+Question: "What can be reused or predicted?"
+Diagram three boxes: "Denoising Step t", "Denoising Step t + 1", "Denoising Step t + 2"
+Feature box: "Cached Features"
+Solid red arrow: "Reuse"
+Dotted red arrow: "Predict"
+Technical caption: "Reuse or predict features across denoising steps"
+Second technical caption, unchanged: "Feature Caching / Feature Forecasting"
+Method list:
+"X-Cache · WAM-Cache"
+"TeaCache · TaylorSeer"
+
+PANEL 05, middle right:
+"05"
+"Cross-Layer Sharing"
+Question: "Can layers share memory?"
+Layer labels, unchanged: "Transformer Layer 1", "Transformer Layer 2", "Transformer Layer 3"
+Shared memory block: "Shared KV"
+Technical caption, wrap if needed:
+"Share KV across layers or reconstruct from other layers"
+Method list: "CLA · LCKV · MiniCache · xKV"
+
+PANEL 06, lower right:
+"06"
+"Representation Compression"
+Question: "How compact can each memory be?"
+Original matrix caption, two lines: "High-Precision" / "(e.g., FP16)"
+Quantized matrix caption, two lines: "Low-Bit" / "(e.g., INT8)"
+Left low-rank factor caption: "Factor A"
+Right low-rank factor caption: "Factor B"
+Preserve the multiplication symbol between low-rank factors.
+Technical caption, unchanged: "Quantization / Low-Rank Compression"
+Method list: "QVG · KIVI · Low-Rank Compression · xKV"
+
+Constraints: every element must be English-only; preserve English spellings, capitalization and reference method names exactly; preserve all explanatory mini schematics and all six directions; no invented results, no new labels beyond those needed for this localization, no watermarks. Produce a polished, legible slide closely matching the original.

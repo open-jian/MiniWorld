@@ -1,0 +1,32 @@
+{
+  "coefficients": [
+    206434.6452947149,
+    -14525.04621168078,
+    316.8297902376494,
+    -1.5025771291222214,
+    0.01855118765387683
+  ],
+  "threshold": 0.4,
+  "max_reuse_steps": 0,
+  "calibration_episode": "002352",
+  "calibration_latents": 65,
+  "checkpoints": {
+    "checkpoint": "/data2/jian/checkpoints/miniworld/MiniWorld_1b_droid.pt",
+    "vae_checkpoint": "/data2/jian/checkpoints/miniworld/Wan2.2_VAE.pth"
+  },
+  "fit_metadata": {
+    "requested_degree": 4,
+    "degree": 4,
+    "samples": 348,
+    "input_min": 0.0009665887337177992,
+    "input_max": 0.04056383669376373,
+    "target": "output_relative_l1",
+    "mae": 0.007062566788463666,
+    "rmse": 0.010212354982567807,
+    "prediction_clamp": "nonnegative",
+    "note": "Dense-trace fit; validate quality and E2E speed in closed-loop inference"
+  },
+  "method": "TeaCache input-aware trunk residual reuse for MiniWorld",
+  "upstream_commit": "7c10efc4702c6b619f47805f7abe4a7a08085aa0",
+  "scope": "MiniWorld 1B DROID; 15x20 latent grid; chunk2/inflight8/history48; fixed coefficients across evaluated episodes."
+}

@@ -1,0 +1,75 @@
+Use case: infographic-diagram.
+Create ONE finished, high-resolution 16:9 landscape academic research roadmap slide, ideally 3840×2160, ready to show to a professor. The subject is a proposed six-direction research plan for improving the memory efficiency of world models. This is a research plan, not completed experimental results.
+
+Design: exceptionally clean academic vector-like infographic rendered as an image. White background, crisp dark navy text, generous whitespace, fine connector lines, subtle rounded rectangular panels, no decorative gradients, no photorealism or 3D. Professional presentation typography, accurate Simplified Chinese and English. The visual should explain six ideas with small schematic drawings, not look like a screenshot of a table.
+
+Overall composition:
+Top title, left aligned: "World Model Memory Efficiency"
+Subtitle: "世界模型记忆系统效率优化：六个研究方向"
+Below, a hub-and-spoke composition. Three spacious panels on the left, vertically ordered 01, 02, 03. Three spacious panels on the right, vertically ordered 04, 05, 06. A narrower central hub with a simple memory-stack icon sits in the middle, connected independently to all SIX panels by thin branching lines with NO arrowheads; these are parallel research directions, not sequential stages. Keep all lines behind panels, no overlaps through words.
+Central hub text, centered: "World Model" / "Memory System"
+Small hub caption: "历史 KV · 中间特征"
+Small objective beneath the hub: "降低存储、访存与计算开销"
+Use restrained navy/blue for panels 01, 02, 05, 06. Highlight panels 03 and 04 with tasteful coral-red number badges, title accents and fine outlines, reflecting the emphasis in the supplied plan. All six panels should have equal visual importance and size; the two red accents are only emphasis.
+
+Within EVERY panel: number badge and large exact English direction title; next, a bold short Chinese question; below that, an explanatory mini schematic that visually distinguishes the mechanism; a compact technical caption; at the bottom a small, readable, muted list of representative methods. All the provided wording must be spelled correctly; no invented paper names or numeric claims.
+
+LEFT TOP PANEL:
+Number "01"
+Title "Pruning / Eviction"
+Chinese question "哪些历史可以删除？"
+Mini schematic: a row of cached KV squares, a few squares dashed and crossed out, arrow to a shorter row of surviving squares; deletion visibly leaves fewer retained elements.
+Technical caption "删除 token、block 或部分 head 的历史 KV"
+Representative methods in two tidy lines:
+"WorldKV · Deep Forcing · SnapKV"
+"ChunkKV · FrameFusion"
+
+LEFT MIDDLE PANEL:
+Number "02"
+Title "Merge"
+Chinese question "哪些信息可以合并？"
+Mini schematic: several small similar-colored token squares converge into two summary squares, visually distinct from deletion.
+Technical caption "区分 hidden-state token 合并与直接 KV 合并"
+Representative methods "FrameFusion · CaM"
+
+LEFT BOTTOM PANEL:
+Number "03"
+Title "Selective History Access"
+Chinese question "当前计算需要访问哪些历史？"
+Mini schematic: one query node connects only to selected cells of a memory grid; unselected cells remain visible but have no active connections.
+Technical caption, two lines:
+"Sparse Attention · KV Cache Selection"
+"KV Cache Budget Allocation"
+Representative methods, two lines:
+"Dummy Forcing · HeadCast"
+"Forcing-KV · ISPA"
+
+RIGHT TOP PANEL:
+Number "04"
+Title "Reuse / Prediction"
+Chinese question "哪些计算可以复用或预测？"
+Mini schematic: three diffusion-step boxes connected in time, with a cached feature from the first step reused at the second and extrapolated to the third. Use a solid curved reuse arrow and dotted prediction arrow; concise labels "复用" and "预测".
+Technical caption, two lines:
+"跨去噪步复用或预测中间特征"
+"Feature Caching / Feature Forecasting"
+Representative methods, two lines:
+"X-Cache · WAM-Cache"
+"TeaCache · TaylorSeer"
+
+RIGHT MIDDLE PANEL:
+Number "05"
+Title "Cross-Layer Sharing"
+Chinese question "不同层能否共享记忆？"
+Mini schematic: three stacked transformer-layer bars connect to one shared KV block, using a single visible common memory block.
+Technical caption "跨层共享 KV，或由其他层的表示恢复"
+Representative methods "CLA · LCKV · MiniCache · xKV"
+
+RIGHT BOTTOM PANEL:
+Number "06"
+Title "Representation Compression"
+Chinese question "每份记忆如何存得更紧凑？"
+Mini schematic: a dense matrix transforms into a compact low-bit matrix and a pair of smaller low-rank factor matrices; visually distinguish compression of representation from deleting memory elements.
+Technical caption "Quantization / Low-Rank Compression"
+Representative methods "QVG · KIVI · 低秩压缩 · xKV"
+
+Rendering constraints: all six numbers and panels exactly once; retain exact English method spellings and capitalization; no duplicate headings, no garbled Chinese, no clipping, no watermarks, no logos, no extra invented annotations. Mini schematics should be simple and precise and serve comprehension. Prioritize legible labels, strong hierarchy, balanced spacing, and publication-quality geometry.

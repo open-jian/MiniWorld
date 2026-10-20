@@ -994,6 +994,7 @@ class MiniWorldModel(nn.Module):
         use_chunk_flash_attn: bool = True,
         headcast_context=None,
         kv_context=None,
+        teacache_context=None,
     ):
         """Streaming forward with optional KV cache injection (RoPE-only).
 
@@ -1003,7 +1004,14 @@ class MiniWorldModel(nn.Module):
         independently select grouped attention and its backend; this flag alone
         does not disable HeadCast. Cache capacity, sink, chunk boundaries and
         RoPE are unchanged.
+
+        ``teacache_context`` enables separate rollout-local trunk-residual
+        reuse. It requires explicit CFG and global window/history identity;
+        KV-writing calls always run every block. The default has no TeaCache
+        state and does not evaluate its input proxy.
         """
+        if teacache_context is not None and (headcast_context is not None or kv_context is not None):
+            raise ValueError('TeaCache must be used separately from HeadCast/KV acceleration')
         if return_kv:
             headcast_context = None
         if kv_context is not None and headcast_context is not None:
@@ -1090,19 +1098,45 @@ class MiniWorldModel(nn.Module):
             frame_offset=int(current_position_offset),
         )
 
-        new_kv_list: List[Optional[Tuple[Tensor, Tensor]]] = [None] * self.depth
-        for idx, block in enumerate(self.blocks):
-            out = block(
-                x, emb_tok, shared_mod_tok, pose_mod_tok, feat_rope_current, attn_mask,
-                past_kv_list[idx], return_kv,
-                cached_chunk_tokens=cached_chunk_tokens,
-                headcast=None if headcast_context is None else headcast_context.for_layer(idx),
-                kv_context=None if kv_context is None else kv_context.for_layer(idx),
-            )
+        # Explicit rollout context is the only way to activate TeaCache. The
+        # normal path does not create state, compute a proxy, or change tensors.
+        tea_decision = None
+        trunk_input = x
+        if teacache_context is not None:
+            ctx = teacache_context
             if return_kv:
-                x, new_kv_list[idx] = out
+                # KV writes always visit every block; no proxy is needed.
+                proxy = x
             else:
-                x = out
+                first = self.blocks[0]
+                shift, scale, *_ = first.modulation(
+                    emb_tok, shared_mod_tok, pose_mod_tok).chunk(6, dim=-1)
+                proxy = modulate(first.norm1(x), shift, scale)
+            tea_decision = ctx.runtime.evaluate(
+                branch=ctx.branch, context=ctx.key, proxy=proxy,
+                trunk_input=x, force_full=ctx.force_full, commit=return_kv,
+                **({} if getattr(ctx, 'trace_metadata', None) is None else
+                   {'trace_metadata': ctx.trace_metadata}),
+            )
+
+        new_kv_list: List[Optional[Tuple[Tensor, Tensor]]] = [None] * self.depth
+        if not return_kv and tea_decision is not None and not tea_decision.should_compute:
+            x = tea_decision.reuse(x)
+        else:
+            for idx, block in enumerate(self.blocks):
+                out = block(
+                    x, emb_tok, shared_mod_tok, pose_mod_tok, feat_rope_current, attn_mask,
+                    past_kv_list[idx], return_kv,
+                    cached_chunk_tokens=cached_chunk_tokens,
+                    headcast=None if headcast_context is None else headcast_context.for_layer(idx),
+                    kv_context=None if kv_context is None else kv_context.for_layer(idx),
+                )
+                if return_kv:
+                    x, new_kv_list[idx] = out
+                else:
+                    x = out
+            if tea_decision is not None:
+                teacache_context.runtime.store(tea_decision, trunk_input, x)
 
         x = self.final_layer(x, emb_tok)
         c_out = self.out_channels
